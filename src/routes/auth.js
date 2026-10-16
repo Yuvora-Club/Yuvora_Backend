@@ -196,6 +196,9 @@ router.post("/login", async (req, res) => {
       ok: true,
       user: { id: uid, uid, ...merged, email: merged.email || data.email || email },
       idToken: data.idToken,
+      // Stored by the frontend: lets it silently mint a fresh ID token when
+      // the old one expires, instead of failing admin calls with 401.
+      refreshToken: data.refreshToken || null,
     });
   } catch (err) {
     console.error("POST /api/auth/login failed:", err?.code || err?.message || err);
@@ -225,6 +228,51 @@ router.post("/reset", async (req, res) => {
   } catch (err) {
     console.error("POST /api/auth/reset failed:", err?.code || err?.message || err);
     return res.status(500).json({ ok: false, error: "Couldn't send the reset link. Try again." });
+  }
+});
+
+// POST /api/auth/token — mint a fresh ID token for a live session.
+// Body: { customToken? } (Join flow — exchanged once) or
+//       { refreshToken? } (login flow — refreshable forever).
+// The frontend calls this automatically when an API answers 401, so admin
+// actions survive token expiry without forcing a manual re-login.
+router.post("/token", async (req, res) => {
+  const key = webApiKey();
+  if (!key) return keyMissing(res);
+  const customToken = String(req.body?.customToken || "");
+  const refreshToken = String(req.body?.refreshToken || "");
+  if (!customToken && !refreshToken) {
+    return res.status(400).json({ ok: false, error: "Nothing to exchange." });
+  }
+  try {
+    if (refreshToken) {
+      const r = await fetch(`https://securetoken.googleapis.com/v1/token?key=${key}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ grant_type: "refresh_token", refresh_token: refreshToken }),
+      });
+      const data = await r.json().catch(() => null);
+      if (!r.ok || !data?.id_token) {
+        return res.status(401).json({ ok: false, error: "Session expired. Please log in again." });
+      }
+      return res.json({ ok: true, idToken: data.id_token, refreshToken: data.refresh_token || refreshToken });
+    }
+    const r = await fetch(
+      `https://identitytoolkit.googleapis.com/v1/accounts:signInWithCustomToken?key=${key}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ token: customToken, returnSecureToken: true }),
+      }
+    );
+    const data = await r.json().catch(() => null);
+    if (!r.ok || !data?.idToken) {
+      return res.status(401).json({ ok: false, error: "Session expired. Please log in again." });
+    }
+    return res.json({ ok: true, idToken: data.idToken, refreshToken: data.refreshToken || null });
+  } catch (err) {
+    console.error("POST /api/auth/token failed:", err?.code || err?.message || err);
+    return res.status(500).json({ ok: false, error: "Could not refresh the session. Try again." });
   }
 });
 
