@@ -262,25 +262,37 @@ router.post("/teams", requireAuth, async (req, res) => {
   const name = String(req.body?.name || "").trim();
   const errors = {};
   if (!eventId) errors.eventId = "Pick an event.";
-  if (!SPORTS_META[sportId]) errors.sportId = "Pick a valid sport.";
+  if (sportId !== "general" && !SPORTS_META[sportId]) errors.sportId = "Pick a valid sport.";
   if (name.length < 2) errors.name = "Give your team a name (min 2 characters).";
   if (name.length > 60) errors.name = "Team name must be 60 characters or fewer.";
   if (Object.keys(errors).length > 0) return res.status(400).json({ ok: false, errors });
+  // Roster rules: predefined per sport, or per-event for general team events.
+  let meta = SPORTS_META[sportId] || null;
+  let isGeneral = false;
   try {
-    const evSnap = await rtdb().ref(`sportEvents/${eventId}`).get();
-    const ev = evSnap.val();
-    if (!ev) return res.status(404).json({ ok: false, error: "Event not found." });
-    if (ev.status !== "open") return res.status(400).json({ ok: false, error: "This event is closed for new teams." });
-    if (!Array.isArray(ev.sports) || !ev.sports.includes(sportId)) {
-      return res.status(400).json({ ok: false, error: "This sport is not part of the event." });
+    if (sportId === "general") {
+      const gSnap = await rtdb().ref(`generalEvents/${eventId}`).get();
+      const gev = gSnap.val();
+      if (!gev) return res.status(404).json({ ok: false, error: "Event not found." });
+      if (gev.kind !== "team") return res.status(400).json({ ok: false, error: "This event takes individual registrations — no teams." });
+      if (gev.status !== "open") return res.status(400).json({ ok: false, error: "This event is closed for new teams." });
+      meta = { min: gev.minPlayers, max: gev.maxPlayers, subs: 0 };
+      isGeneral = true;
+    } else {
+      const evSnap = await rtdb().ref(`sportEvents/${eventId}`).get();
+      const ev = evSnap.val();
+      if (!ev) return res.status(404).json({ ok: false, error: "Event not found." });
+      if (ev.status !== "open") return res.status(400).json({ ok: false, error: "This event is closed for new teams." });
+      if (!Array.isArray(ev.sports) || !ev.sports.includes(sportId)) {
+        return res.status(400).json({ ok: false, error: "This sport is not part of the event." });
+      }
     }
     if (await existingRoster(req.member.uid, eventId, sportId)) {
-      return res.status(400).json({ ok: false, error: "You already have a team in this sport for this event." });
+      return res.status(400).json({ ok: false, error: isGeneral ? "You already have a team for this event." : "You already have a team in this sport for this event." });
     }
     if (await pendingRequest(req.member.uid, eventId, sportId)) {
       return res.status(400).json({ ok: false, error: "You already asked to join a team here — wait for the captain." });
     }
-    const meta = SPORTS_META[sportId];
     const now = new Date().toISOString();
     const captainName = await memberName(req.member.uid, req.member.name);
     const ref = rtdb().ref("teams").push();
@@ -465,6 +477,198 @@ router.delete("/teams/:id", requireAuth, async (req, res) => {
   } catch (err) {
     console.error("DELETE /api/teams/:id failed:", err?.message || err);
     return res.status(500).json({ ok: false, error: "Could not delete the team." });
+  }
+});
+
+// ---------- general events (summits, fairs, jams — team OR individual) ----
+// Individual: direct registration, no teams. Team: the same team engine as
+// sports (captain approval, auto-lock), with the roster window set per event.
+
+function validateGeneralEvent(body) {
+  const errors = {};
+  const title = String(body?.title ?? "").trim();
+  const kind = String(body?.kind ?? "individual").trim();
+  const description = String(body?.description ?? body?.body ?? "").trim();
+  const venue = String(body?.venue ?? "").trim().slice(0, 120);
+  const eventDate = String(body?.eventDate ?? body?.date ?? "").trim();
+  const status = String(body?.status ?? "open").trim();
+  let fee = null;
+  if (body?.fee !== undefined && body?.fee !== "" && body?.fee !== null) {
+    fee = Number(body.fee);
+    if (!Number.isFinite(fee) || fee < 0 || fee > 100000) errors.fee = "Fee must be a number between 0 and 100000 (or leave it empty for free).";
+    else fee = Math.round(fee);
+  }
+  let minPlayers = null;
+  let maxPlayers = null;
+  if (kind !== "team" && kind !== "individual") errors.kind = "Kind must be team or individual.";
+  if (title.length < 3) errors.title = "Give the event a title (min 3 characters).";
+  if (title.length > 120) errors.title = "Title must be 120 characters or fewer.";
+  if (description.length > 2000) errors.description = "Description must be 2000 characters or fewer.";
+  if (status !== "open" && status !== "closed") errors.status = "Status must be open or closed.";
+  if (kind === "team") {
+    minPlayers = body?.minPlayers === "" || body?.minPlayers == null ? null : Number(body.minPlayers);
+    maxPlayers = body?.maxPlayers === "" || body?.maxPlayers == null ? null : Number(body.maxPlayers);
+    if (!Number.isFinite(minPlayers) || minPlayers < 2 || minPlayers > 50) errors.minPlayers = "Team minimum must be between 2 and 50.";
+    if (!Number.isFinite(maxPlayers) || maxPlayers < 2 || maxPlayers > 50) errors.maxPlayers = "Team maximum must be between 2 and 50.";
+    if (Number.isFinite(minPlayers) && Number.isFinite(maxPlayers) && minPlayers > maxPlayers) {
+      errors.maxPlayers = "Maximum can't be smaller than the minimum.";
+    }
+  }
+  return { errors, clean: { title, kind, description, venue: venue || null, eventDate: eventDate || null, fee, minPlayers, maxPlayers, status } };
+}
+
+async function generalEventWithCount(id, ev) {
+  let regCount = 0;
+  try {
+    const snap = await rtdb().ref(`eventRegs/${id}`).get();
+    const val = snap.val() || {};
+    regCount = Object.keys(val).length;
+  } catch { /* ignore */ }
+  return { id, ...ev, regCount };
+}
+
+// Public list (with registration headcounts, no names).
+router.get("/general-events", async (_req, res) => {
+  if (!isFirebaseReady()) return notReady(res);
+  try {
+    const snap = await rtdb().ref("generalEvents").get();
+    const val = snap.val() || {};
+    const events = [];
+    for (const [id, ev] of Object.entries(val)) {
+      events.push(await generalEventWithCount(id, ev));
+    }
+    events.sort((x, y) => String(y.createdAt || "").localeCompare(String(x.createdAt || "")));
+    return res.json({ ok: true, events });
+  } catch (err) {
+    console.error("GET /api/general-events failed:", err?.message || err);
+    return res.status(500).json({ ok: false, error: "Could not load events." });
+  }
+});
+
+router.post("/general-events", requireAdmin, async (req, res) => {
+  const { errors, clean } = validateGeneralEvent(req.body);
+  if (Object.keys(errors).length > 0) return res.status(400).json({ ok: false, errors });
+  try {
+    const now = new Date().toISOString();
+    const ref = rtdb().ref("generalEvents").push();
+    const event = { ...clean, createdBy: req.admin.uid, createdAt: now, updatedAt: now };
+    await ref.set(event);
+    return res.status(201).json({ ok: true, event: { id: ref.key, ...event, regCount: 0 } });
+  } catch (err) {
+    console.error("POST /api/general-events failed:", err?.message || err);
+    return res.status(500).json({ ok: false, error: "Could not create the event." });
+  }
+});
+
+router.put("/general-events/:id", requireAdmin, async (req, res) => {
+  const id = String(req.params.id || "").trim();
+  if (!id || /[.#$[\]]/.test(id)) return res.status(400).json({ ok: false, error: "Invalid event id." });
+  const { errors, clean } = validateGeneralEvent(req.body);
+  if (Object.keys(errors).length > 0) return res.status(400).json({ ok: false, errors });
+  try {
+    const ref = rtdb().ref(`generalEvents/${id}`);
+    const snap = await ref.get();
+    if (!snap.exists()) return res.status(404).json({ ok: false, error: "Event not found." });
+    const prev = snap.val() || {};
+    const updated = { ...prev, ...clean, updatedAt: new Date().toISOString() };
+    await ref.set(updated);
+    return res.json({ ok: true, event: await generalEventWithCount(id, updated) });
+  } catch (err) {
+    console.error("PUT /api/general-events/:id failed:", err?.message || err);
+    return res.status(500).json({ ok: false, error: "Could not update the event." });
+  }
+});
+
+router.delete("/general-events/:id", requireAdmin, async (req, res) => {
+  const id = String(req.params.id || "").trim();
+  if (!id || /[.#$[\]]/.test(id)) return res.status(400).json({ ok: false, error: "Invalid event id." });
+  try {
+    const ref = rtdb().ref(`generalEvents/${id}`);
+    if (!(await ref.get()).exists()) return res.status(404).json({ ok: false, error: "Event not found." });
+    // Cascade: its teams (+ requests) and individual registrations.
+    const teamsSnap = await rtdb().ref("teams").get();
+    const teams = teamsSnap.val() || {};
+    for (const [teamId, t] of Object.entries(teams)) {
+      if (t.eventId === id) {
+        await rtdb().ref(`teams/${teamId}`).remove();
+        await rtdb().ref(`teamRequests/${teamId}`).remove();
+      }
+    }
+    await rtdb().ref(`eventRegs/${id}`).remove();
+    await ref.remove();
+    return res.json({ ok: true, id });
+  } catch (err) {
+    console.error("DELETE /api/general-events/:id failed:", err?.message || err);
+    return res.status(500).json({ ok: false, error: "Could not delete the event." });
+  }
+});
+
+// Individual event: direct registration (members only, one per event).
+router.post("/general-events/:id/register", requireAuth, async (req, res) => {
+  const id = String(req.params.id || "").trim();
+  try {
+    const snap = await rtdb().ref(`generalEvents/${id}`).get();
+    const ev = snap.val();
+    if (!ev) return res.status(404).json({ ok: false, error: "Event not found." });
+    if (ev.kind !== "individual") {
+      return res.status(400).json({ ok: false, error: "This is a team event — join or form a team instead." });
+    }
+    if (ev.status !== "open") return res.status(400).json({ ok: false, error: "Registrations are closed for this event." });
+    const existing = await rtdb().ref(`eventRegs/${id}/${req.member.uid}`).get();
+    if (existing.exists()) return res.status(400).json({ ok: false, error: "You are already registered." });
+    const name = await memberName(req.member.uid, req.member.name);
+    await rtdb().ref(`eventRegs/${id}/${req.member.uid}`).set({ name, registeredAt: new Date().toISOString() });
+    return res.status(201).json({ ok: true });
+  } catch (err) {
+    console.error("POST /api/general-events/:id/register failed:", err?.message || err);
+    return res.status(500).json({ ok: false, error: "Could not register." });
+  }
+});
+
+router.delete("/general-events/:id/register", requireAuth, async (req, res) => {
+  const id = String(req.params.id || "").trim();
+  try {
+    const ref = rtdb().ref(`eventRegs/${id}/${req.member.uid}`);
+    if (!(await ref.get()).exists()) return res.status(400).json({ ok: false, error: "You are not registered." });
+    await ref.remove();
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("DELETE /api/general-events/:id/register failed:", err?.message || err);
+    return res.status(500).json({ ok: false, error: "Could not unregister." });
+  }
+});
+
+// Who registered — admin only (names stay private from other members).
+router.get("/general-events/:id/registrations", requireAdmin, async (req, res) => {
+  const id = String(req.params.id || "").trim();
+  try {
+    if (!(await rtdb().ref(`generalEvents/${id}`).get()).exists()) {
+      return res.status(404).json({ ok: false, error: "Event not found." });
+    }
+    const snap = await rtdb().ref(`eventRegs/${id}`).get();
+    const val = snap.val() || {};
+    const registrations = Object.entries(val).map(([uid, r]) => ({ uid, name: r.name, registeredAt: r.registeredAt }));
+    registrations.sort((a, b) => String(a.registeredAt || "").localeCompare(String(b.registeredAt || "")));
+    return res.json({ ok: true, registrations });
+  } catch (err) {
+    console.error("GET /api/general-events/:id/registrations failed:", err?.message || err);
+    return res.status(500).json({ ok: false, error: "Could not load registrations." });
+  }
+});
+
+// My individual registrations (badges on the member board).
+router.get("/my-registrations", requireAuth, async (req, res) => {
+  try {
+    const snap = await rtdb().ref("eventRegs").get();
+    const val = snap.val() || {};
+    const mine = [];
+    for (const [eventId, byUser] of Object.entries(val)) {
+      if (byUser && byUser[req.member.uid]) mine.push(eventId);
+    }
+    return res.json({ ok: true, eventIds: mine });
+  } catch (err) {
+    console.error("GET /api/my-registrations failed:", err?.message || err);
+    return res.status(500).json({ ok: false, error: "Could not load your registrations." });
   }
 });
 
