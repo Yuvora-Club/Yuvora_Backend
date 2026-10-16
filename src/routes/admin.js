@@ -155,4 +155,107 @@ router.post("/users", async (req, res) => {
   }
 });
 
+// ---- Change own credentials (Profile tab -> "Login credentials") ----
+// Both endpoints re-verify the CURRENT password via Firebase before changing
+// anything, so a stolen/leftover admin session alone cannot hijack the account.
+
+function webApiKey() {
+  return String(process.env.FIREBASE_WEB_API_KEY || "").trim();
+}
+
+// Returns the Firebase user record for the caller, or sends 401 when the
+// supplied current password is wrong. Null = response already sent.
+async function verifyCurrentPassword(req, res, currentPassword) {
+  const key = webApiKey();
+  if (!key) {
+    res.status(503).json({
+      ok: false,
+      error: "Password checks are not configured on the backend yet. Add FIREBASE_WEB_API_KEY.",
+    });
+    return null;
+  }
+  let profileEmail = null;
+  try {
+    const snap = await rtdb().ref(`users/${req.admin.uid}`).get();
+    profileEmail = (snap.val() && snap.val().email) || null;
+  } catch {
+    profileEmail = null;
+  }
+  const email = (profileEmail || req.admin.email || "").toLowerCase();
+  if (!email) {
+    res.status(400).json({ ok: false, errors: { password: "Could not find your account email." } });
+    return null;
+  }
+  try {
+    const r = await fetch(
+      `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${key}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email, password: String(currentPassword || ""), returnSecureToken: true }),
+      }
+    );
+    if (!r.ok) {
+      res.status(401).json({ ok: false, errors: { password: "Current password is wrong." } });
+      return null;
+    }
+  } catch {
+    res.status(500).json({ ok: false, error: "Could not verify the current password. Try again." });
+    return null;
+  }
+  return { uid: req.admin.uid, email };
+}
+
+// PUT /api/admin/credentials/email { newEmail, password } — change login email.
+router.put("/credentials/email", async (req, res) => {
+  const newEmail = String(req.body?.newEmail ?? req.body?.email ?? "").trim().toLowerCase();
+  if (!EMAIL_RE.test(newEmail)) {
+    return res.status(400).json({ ok: false, errors: { newEmail: "Enter a valid new email address." } });
+  }
+  const who = await verifyCurrentPassword(req, res, req.body?.password);
+  if (!who) return;
+  if (newEmail === who.email) {
+    return res.status(400).json({ ok: false, errors: { newEmail: "This is already your login email." } });
+  }
+  try {
+    await auth().updateUser(who.uid, { email: newEmail });
+    await rtdb().ref(`users/${who.uid}`).update({ email: newEmail, updatedAt: new Date().toISOString() });
+    const snap = await rtdb().ref(`users/${who.uid}`).get();
+    return res.json({ ok: true, admin: publicProfile(who.uid, snap.val()) });
+  } catch (err) {
+    if (err?.code === "auth/email-already-exists") {
+      return res.status(409).json({ ok: false, errors: { newEmail: "This email already has an account." } });
+    }
+    console.error("PUT /api/admin/credentials/email failed:", err?.code || err?.message || err);
+    return res.status(500).json({ ok: false, error: "Could not change the email." });
+  }
+});
+
+// PUT /api/admin/credentials/password { currentPassword, newPassword }.
+router.put("/credentials/password", async (req, res) => {
+  const currentPassword = String(req.body?.currentPassword ?? req.body?.password ?? "");
+  const newPassword = String(req.body?.newPassword ?? "");
+  if (!currentPassword) {
+    return res.status(400).json({ ok: false, errors: { password: "Enter your current password." } });
+  }
+  if (!newPassword || newPassword.length < 8) {
+    return res.status(400).json({ ok: false, errors: { newPassword: "New password needs at least 8 characters." } });
+  }
+  if (newPassword === currentPassword) {
+    return res.status(400).json({ ok: false, errors: { newPassword: "New password must differ from the current one." } });
+  }
+  const who = await verifyCurrentPassword(req, res, currentPassword);
+  if (!who) return;
+  try {
+    await auth().updateUser(who.uid, { password: newPassword });
+    // Existing sessions stay valid until their tokens expire, so the frontend
+    // signs out immediately and asks for a fresh login with the new password.
+    await auth().revokeRefreshTokens(who.uid);
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("PUT /api/admin/credentials/password failed:", err?.code || err?.message || err);
+    return res.status(500).json({ ok: false, error: "Could not change the password." });
+  }
+});
+
 export default router;
