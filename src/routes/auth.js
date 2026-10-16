@@ -86,6 +86,8 @@ router.post("/register", async (req, res) => {
       altEmail: clean.altEmail,
       phone: clean.phone,
       age: clean.age,
+      birthDate: null,
+      role: "member",
       termsAcceptedAt: new Date().toISOString(),
       createdAt: new Date().toISOString(),
       provider: "password",
@@ -177,9 +179,22 @@ router.post("/login", async (req, res) => {
     } catch {
       /* profile optional — auth already succeeded */
     }
+    // Merge the Auth custom claim role so seeded admins are recognized
+    // even if their RTDB profile was written before `role` existed.
+    let claimRole = null;
+    try {
+      const rec = await auth().getUser(uid);
+      if (rec?.customClaims?.admin === true || rec?.customClaims?.role === "admin") {
+        claimRole = "admin";
+      }
+    } catch {
+      /* claims optional */
+    }
+    const merged = { ...(profile || {}) };
+    if (claimRole && merged.role !== "admin") merged.role = "admin";
     return res.json({
       ok: true,
-      user: { id: uid, uid, ...(profile || {}), email: (profile && profile.email) || data.email || email },
+      user: { id: uid, uid, ...merged, email: merged.email || data.email || email },
       idToken: data.idToken,
     });
   } catch (err) {

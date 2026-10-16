@@ -3,6 +3,8 @@ import express from "express";
 import cors from "cors";
 import { initFirebase } from "./firebase.js";
 import authRoutes from "./routes/auth.js";
+import announcementRoutes from "./routes/announcements.js";
+import adminRoutes from "./routes/admin.js";
 
 const app = express();
 const PORT = Number(process.env.PORT || 4000);
@@ -50,6 +52,8 @@ app.get("/api/health", (_req, res) => {
 });
 
 app.use("/api/auth", authRoutes);
+app.use("/api/announcements", announcementRoutes);
+app.use("/api/admin", adminRoutes);
 
 app.use((req, res) => {
   res.status(404).json({ ok: false, error: `No route: ${req.method} ${req.path}` });
