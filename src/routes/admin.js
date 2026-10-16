@@ -155,106 +155,93 @@ router.post("/users", async (req, res) => {
   }
 });
 
-// ---- Change own credentials (Profile tab -> "Login credentials") ----
-// Both endpoints re-verify the CURRENT password via Firebase before changing
-// anything, so a stolen/leftover admin session alone cannot hijack the account.
+// ---- Edit own profile (Profile tab). ONLY these four fields are writable:
+// phone, birthDate, age, role. Name/email stay fixed so the admin identity
+// can't be morphed by accident.
+//   PUT /api/admin/profile { phone?, birthDate?, age?, role? }
+// Age rule: when birthDate is present, age is always recomputed from it
+// (birthday-aware, auto-increments yearly); a manual age is stored only when
+// there is no birth date.
 
-function webApiKey() {
-  return String(process.env.FIREBASE_WEB_API_KEY || "").trim();
+function cleanPhoneInput(raw) {
+  const digits = String(raw || "").replace(/\D/g, "").replace(/^91(?=\d{10}$)/, "");
+  return digits.length === 10 ? digits : "";
 }
 
-// Returns the Firebase user record for the caller, or sends 401 when the
-// supplied current password is wrong. Null = response already sent.
-async function verifyCurrentPassword(req, res, currentPassword) {
-  const key = webApiKey();
-  if (!key) {
-    res.status(503).json({
-      ok: false,
-      error: "Password checks are not configured on the backend yet. Add FIREBASE_WEB_API_KEY.",
-    });
-    return null;
+// PUT /api/admin/profile — update own phone / birthDate / age / role.
+router.put("/profile", async (req, res) => {
+  const errors = {};
+  const patch = {};
+  const body = req.body || {};
+
+  if (body.phone !== undefined) {
+    const phone = cleanPhoneInput(body.phone);
+    if (!phone) errors.phone = "Enter a 10-digit contact number.";
+    else patch.phone = phone;
   }
-  let profileEmail = null;
-  try {
-    const snap = await rtdb().ref(`users/${req.admin.uid}`).get();
-    profileEmail = (snap.val() && snap.val().email) || null;
-  } catch {
-    profileEmail = null;
-  }
-  const email = (profileEmail || req.admin.email || "").toLowerCase();
-  if (!email) {
-    res.status(400).json({ ok: false, errors: { password: "Could not find your account email." } });
-    return null;
-  }
-  try {
-    const r = await fetch(
-      `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${key}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email, password: String(currentPassword || ""), returnSecureToken: true }),
+
+  let birthDate = null;
+  if (body.birthDate !== undefined) {
+    birthDate = String(body.birthDate || "").trim();
+    if (birthDate) {
+      const age = ageFromBirthDate(birthDate);
+      if (age == null) errors.birthDate = "Birth date must be YYYY-MM-DD (e.g. 2011-03-14).";
+      else {
+        patch.birthDate = birthDate;
+        patch.age = age; // birth date always wins over a manual age
       }
-    );
-    if (!r.ok) {
-      res.status(401).json({ ok: false, errors: { password: "Current password is wrong." } });
-      return null;
+    } else {
+      patch.birthDate = null; // cleared -> manual age below (if given) applies
     }
-  } catch {
-    res.status(500).json({ ok: false, error: "Could not verify the current password. Try again." });
-    return null;
   }
-  return { uid: req.admin.uid, email };
-}
 
-// PUT /api/admin/credentials/email { newEmail, password } — change login email.
-router.put("/credentials/email", async (req, res) => {
-  const newEmail = String(req.body?.newEmail ?? req.body?.email ?? "").trim().toLowerCase();
-  if (!EMAIL_RE.test(newEmail)) {
-    return res.status(400).json({ ok: false, errors: { newEmail: "Enter a valid new email address." } });
+  if (body.age !== undefined && body.age !== "" && body.age !== null) {
+    const n = Number(body.age);
+    if (!Number.isFinite(n) || n < 10 || n > 100) errors.age = "Age must be between 10 and 100.";
+    else if (!patch.birthDate) patch.age = Math.floor(n); // birth date wins when set
   }
-  const who = await verifyCurrentPassword(req, res, req.body?.password);
-  if (!who) return;
-  if (newEmail === who.email) {
-    return res.status(400).json({ ok: false, errors: { newEmail: "This is already your login email." } });
+
+  if (body.role !== undefined) {
+    const role = String(body.role || "").trim();
+    if (role !== "admin" && role !== "member") errors.role = "Role must be admin or member.";
+    else patch.role = role;
   }
+
+  if (Object.keys(errors).length > 0) return res.status(400).json({ ok: false, errors });
+  if (Object.keys(patch).length === 0) {
+    return res.status(400).json({ ok: false, error: "Nothing to update." });
+  }
+
   try {
-    await auth().updateUser(who.uid, { email: newEmail });
-    await rtdb().ref(`users/${who.uid}`).update({ email: newEmail, updatedAt: new Date().toISOString() });
-    const snap = await rtdb().ref(`users/${who.uid}`).get();
-    return res.json({ ok: true, admin: publicProfile(who.uid, snap.val()) });
-  } catch (err) {
-    if (err?.code === "auth/email-already-exists") {
-      return res.status(409).json({ ok: false, errors: { newEmail: "This email already has an account." } });
+    // Never strand the club with zero admins: block self-demotion when this
+    // admin is the last one standing.
+    if (patch.role === "member") {
+      const all = (await rtdb().ref("users").get()).val() || {};
+      const otherAdmins = Object.entries(all).filter(
+        ([uid, p]) => uid !== req.admin.uid && p && p.role === "admin"
+      );
+      if (otherAdmins.length === 0) {
+        return res.status(400).json({
+          ok: false,
+          errors: { role: "You are the last admin — promote someone else first." },
+        });
+      }
     }
-    console.error("PUT /api/admin/credentials/email failed:", err?.code || err?.message || err);
-    return res.status(500).json({ ok: false, error: "Could not change the email." });
-  }
-});
 
-// PUT /api/admin/credentials/password { currentPassword, newPassword }.
-router.put("/credentials/password", async (req, res) => {
-  const currentPassword = String(req.body?.currentPassword ?? req.body?.password ?? "");
-  const newPassword = String(req.body?.newPassword ?? "");
-  if (!currentPassword) {
-    return res.status(400).json({ ok: false, errors: { password: "Enter your current password." } });
-  }
-  if (!newPassword || newPassword.length < 8) {
-    return res.status(400).json({ ok: false, errors: { newPassword: "New password needs at least 8 characters." } });
-  }
-  if (newPassword === currentPassword) {
-    return res.status(400).json({ ok: false, errors: { newPassword: "New password must differ from the current one." } });
-  }
-  const who = await verifyCurrentPassword(req, res, currentPassword);
-  if (!who) return;
-  try {
-    await auth().updateUser(who.uid, { password: newPassword });
-    // Existing sessions stay valid until their tokens expire, so the frontend
-    // signs out immediately and asks for a fresh login with the new password.
-    await auth().revokeRefreshTokens(who.uid);
-    return res.json({ ok: true });
+    patch.updatedAt = new Date().toISOString();
+    await rtdb().ref(`users/${req.admin.uid}`).update(patch);
+
+    // Keep the Auth display name / claims consistent when role changes.
+    if (patch.role) {
+      const claims = patch.role === "admin" ? { admin: true, role: "admin" } : {};
+      await auth().setCustomUserClaims(req.admin.uid, claims);
+    }
+
+    const snap = await rtdb().ref(`users/${req.admin.uid}`).get();
+    return res.json({ ok: true, admin: publicProfile(req.admin.uid, snap.val()) });
   } catch (err) {
-    console.error("PUT /api/admin/credentials/password failed:", err?.code || err?.message || err);
-    return res.status(500).json({ ok: false, error: "Could not change the password." });
+    console.error("PUT /api/admin/profile failed:", err?.code || err?.message || err);
+    return res.status(500).json({ ok: false, error: "Could not update the profile." });
   }
 });
 
