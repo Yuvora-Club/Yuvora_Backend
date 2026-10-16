@@ -19,7 +19,7 @@ import { initFirebase, auth, rtdb } from "../src/firebase.js";
 
 const ADMIN = {
   fullName: "Rishith Manchala",
-  email: "rishithamnchala989@gmail.com",
+  email: "rishithmanchala989@gmail.com",
   password: "Rishith@1234",
   phone: "7075224965",
   birthDate: "2011-03-14", // 14 Mar 2011 -> age 15 in 2026; auto-increments yearly
