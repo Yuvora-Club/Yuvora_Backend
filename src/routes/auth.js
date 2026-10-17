@@ -98,6 +98,36 @@ router.post("/register", async (req, res) => {
     };
     await rtdb().ref(`users/${record.uid}`).set(profile);
 
+    // Mint the member's stable seed-pass code (YV-XXXX) + reverse index now,
+    // so the gate can verify them from any device. Deterministic from uid.
+    try {
+      let h = 0x811c9dc5;
+      const s = String(record.uid || "");
+      for (let i = 0; i < s.length; i++) {
+        h ^= s.charCodeAt(i);
+        h = Math.imul(h, 0x01000193) >>> 0;
+      }
+      let num = (h % 9000) + 1000;
+      let code = null;
+      for (let tries = 0; tries < 9000; tries++) {
+        const candidate = `YV-${String(num)}`;
+        const idx = await rtdb().ref(`seedPassIndex/${candidate}`).get();
+        const val = idx.val();
+        if (!val || val.uid === record.uid) {
+          code = candidate;
+          break;
+        }
+        num = num >= 9999 ? 1000 : num + 1;
+      }
+      if (code) {
+        await rtdb().ref(`users/${record.uid}`).update({ seedPassCode: code });
+        await rtdb().ref(`seedPassIndex/${code}`).set({ uid: record.uid });
+        profile.seedPassCode = code;
+      }
+    } catch (e) {
+      console.warn("[register] seed-pass mint skipped:", e?.message || e);
+    }
+
     // Custom token lets the frontend sign the user in immediately => "joined".
     const customToken = await auth().createCustomToken(record.uid, { joinedVia: "join-us" });
 

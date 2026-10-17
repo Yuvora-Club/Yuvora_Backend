@@ -64,6 +64,62 @@ function validateNewAdmin(body) {
   return { errors, clean: { fullName, email, school, phone, birthDate: birthDate || null, age, password } };
 }
 
+// Seed passes — gate verification for raves / socials.
+// Every member gets a stable `seedPassCode` (format YV-XXXX, e.g. YV-8930)
+// minted at registration. Admins verify + consume it at the gate.
+//
+// Storage (Realtime Database):
+//   users/{uid}.seedPassCode            stable per-member code (YV-XXXX)
+//   seedPassIndex/{CODE} -> { uid }     reverse lookup for instant gate verify
+//   seedPassScans/{pushId}              audit log of gate scans
+// Routes (all requireAdmin):
+//   POST /api/admin/seedpass/verify { code }  -> member profile + scan history
+//   POST /api/admin/seedpass/consume { code, note? } -> marks used (idempotent-ish, logs every scan)
+
+function seedPassCodeFromUid(uid) {
+  // Stable + deterministic so re-reads never rotate a member's printed code.
+  // Simple FNV-ish hash of the uid -> YV-1000..YV-9999 (9000 slots; collisions
+  // fall back to a per-user suffix resolved at ensure-time).
+  let h = 0x811c9dc5;
+  const s = String(uid || "");
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return `YV-${String((h % 9000) + 1000)}`;
+}
+
+async function ensureSeedPassCode(uid) {
+  const userRef = rtdb().ref(`users/${uid}`);
+  const snap = await userRef.get();
+  const profile = snap.val();
+  if (!profile) return null;
+  let code = String(profile.seedPassCode || "").trim().toUpperCase();
+  if (/^YV-\d{4}$/.test(code)) {
+    // Repair the reverse index if missing.
+    try {
+      const idx = await rtdb().ref(`seedPassIndex/${code}`).get();
+      if (!idx.exists()) await rtdb().ref(`seedPassIndex/${code}`).set({ uid });
+    } catch { /* index repair is best-effort */ }
+    return code;
+  }
+  // Mint: deterministic base, bump on collision with another uid's code.
+  let base = seedPassCodeFromUid(uid);
+  let num = Number(base.slice(3));
+  for (let tries = 0; tries < 9000; tries++) {
+    const candidate = `YV-${String(num)}`;
+    const idx = await rtdb().ref(`seedPassIndex/${candidate}`).get();
+    const val = idx.val();
+    if (!val || val.uid === uid) {
+      await userRef.update({ seedPassCode: candidate });
+      await rtdb().ref(`seedPassIndex/${candidate}`).set({ uid });
+      return candidate;
+    }
+    num = num >= 9999 ? 1000 : num + 1;
+  }
+  return null;
+}
+
 function publicProfile(uid, p) {
   if (!p) return null;
   return {
@@ -76,6 +132,7 @@ function publicProfile(uid, p) {
     birthDate: p.birthDate || null,
     age: p.birthDate ? ageFromBirthDate(p.birthDate) ?? p.age ?? null : (p.age ?? null),
     role: p.role || "member",
+    seedPassCode: p.seedPassCode || null,
     createdAt: p.createdAt || null,
   };
 }
@@ -247,6 +304,102 @@ router.put("/profile", async (req, res) => {
   } catch (err) {
     console.error("PUT /api/admin/profile failed:", err?.code || err?.message || err);
     return res.status(500).json({ ok: false, error: "Could not update the profile." });
+  }
+});
+
+// ---- Seed-pass gate (Verify tab in /admin) ----
+// POST /api/admin/seedpass/verify { code } -> member profile + scan history.
+// Code format: YV-XXXX (case-insensitive, dash optional). Mint-on-first-verify
+// so members who joined before this feature still get a stable code.
+router.post("/seedpass/verify", async (req, res) => {
+  const raw = String(req.body?.code || "").trim().toUpperCase().replace(/\s+/g, "");
+  const m = raw.match(/^YV-?(\d{3,6})$/);
+  if (!m) return res.status(400).json({ ok: false, error: "Enter a seed-pass code like YV-8930." });
+  const code = `YV-${m[1].padStart(4, "0").slice(-4)}`;
+  try {
+    const idxSnap = await rtdb().ref(`seedPassIndex/${code}`).get();
+    let uid = idxSnap.val()?.uid || null;
+    if (!uid) {
+      // No index yet — sweep users for a stored code (backfill), else not found.
+      const usersSnap = await rtdb().ref("users").get();
+      const users = usersSnap.val() || {};
+      for (const [id, p] of Object.entries(users)) {
+        if (String(p?.seedPassCode || "").trim().toUpperCase() === code) {
+          uid = id;
+          await rtdb().ref(`seedPassIndex/${code}`).set({ uid });
+          break;
+        }
+      }
+    }
+    if (!uid) return res.status(404).json({ ok: false, error: `No member found for ${code}.` });
+    const codeNow = await ensureSeedPassCode(uid);
+    const profSnap = await rtdb().ref(`users/${uid}`).get();
+    const profile = profSnap.val();
+    if (!profile) return res.status(404).json({ ok: false, error: `No member found for ${code}.` });
+    // Recent scans for this code (same gate, any admin).
+    const scansSnap = await rtdb().ref("seedPassScans").orderByChild("code").equalTo(code).get();
+    const scansVal = scansSnap.val() || {};
+    const scans = Object.entries(scansVal)
+      .map(([id, s]) => ({ id, ...s }))
+      .sort((a, b) => String(b.at || "").localeCompare(String(a.at || "")))
+      .slice(0, 10);
+    return res.json({
+      ok: true,
+      pass: {
+        code: codeNow || code,
+        status: scans.length > 0 ? "scanned" : "active",
+        scanCount: scans.length,
+      },
+      member: { ...publicProfile(uid, profile), seedPassCode: codeNow || code },
+      scans,
+    });
+  } catch (err) {
+    console.error("POST /api/admin/seedpass/verify failed:", err?.message || err);
+    return res.status(500).json({ ok: false, error: "Could not verify that code. Try again." });
+  }
+});
+
+// POST /api/admin/seedpass/consume { code, note? } -> logs a gate entry scan.
+// Every scan is logged; the response tells the gate if this code was already
+// scanned before (possible double-use) so the admin can decide.
+router.post("/seedpass/consume", async (req, res) => {
+  const raw = String(req.body?.code || "").trim().toUpperCase().replace(/\s+/g, "");
+  const note = String(req.body?.note || "").trim().slice(0, 200);
+  const m = raw.match(/^YV-?(\d{3,6})$/);
+  if (!m) return res.status(400).json({ ok: false, error: "Enter a seed-pass code like YV-8930." });
+  const code = `YV-${m[1].padStart(4, "0").slice(-4)}`;
+  try {
+    const idxSnap = await rtdb().ref(`seedPassIndex/${code}`).get();
+    const uid = idxSnap.val()?.uid || null;
+    if (!uid) return res.status(404).json({ ok: false, error: `No member found for ${code}.` });
+    const codeNow = await ensureSeedPassCode(uid);
+    const profSnap = await rtdb().ref(`users/${uid}`).get();
+    const profile = profSnap.val();
+    if (!profile) return res.status(404).json({ ok: false, error: `No member found for ${code}.` });
+    const priorSnap = await rtdb().ref("seedPassScans").orderByChild("code").equalTo(code).get();
+    const priorCount = priorSnap.val() ? Object.keys(priorSnap.val()).length : 0;
+    const at = new Date().toISOString();
+    await rtdb().ref("seedPassScans").push({
+      code,
+      uid,
+      by: req.admin.uid,
+      at,
+      note: note || null,
+    });
+    return res.json({
+      ok: true,
+      pass: {
+        code: codeNow || code,
+        status: "scanned",
+        scanCount: priorCount + 1,
+        alreadyScanned: priorCount > 0,
+        at,
+      },
+      member: { ...publicProfile(uid, profile), seedPassCode: codeNow || code },
+    });
+  } catch (err) {
+    console.error("POST /api/admin/seedpass/consume failed:", err?.message || err);
+    return res.status(500).json({ ok: false, error: "Could not record that scan. Try again." });
   }
 });
 
