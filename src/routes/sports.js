@@ -59,6 +59,25 @@ function teamStatus(team) {
   return "forming";
 }
 
+// Registrations are closed once an admin closes the event OR the deadline hits.
+function regClosed(ev) {
+  if (!ev) return true;
+  if (ev.status === "closed") return true;
+  const t = ev.regDeadline ? Date.parse(ev.regDeadline) : NaN;
+  return Number.isFinite(t) && t <= Date.now();
+}
+
+// Same check for a team's parent event (sports events vs general events).
+async function eventRegClosed(eventId, sportId) {
+  try {
+    const path = sportId === "general" ? `generalEvents/${eventId}` : `sportEvents/${eventId}`;
+    const snap = await rtdb().ref(path).get();
+    return regClosed(snap.val());
+  } catch {
+    return false;
+  }
+}
+
 // One roster per member per sport per event — enforced on create + request.
 async function existingRoster(uid, eventId, sportId) {
   const snap = await rtdb().ref("teams").get();
@@ -102,7 +121,8 @@ router.get("/sport-events", async (_req, res) => {
   if (!isFirebaseReady()) return notReady(res);
   try {
     const snap = await rtdb().ref("sportEvents").get();
-    return res.json({ ok: true, events: toList(snap.val()) });
+    const events = toList(snap.val()).map((ev) => ({ ...ev, regClosed: regClosed(ev) }));
+    return res.json({ ok: true, events });
   } catch (err) {
     console.error("GET /api/sport-events failed:", err?.message || err);
     return res.status(500).json({ ok: false, error: "Could not load events." });
@@ -120,13 +140,19 @@ function validateEvent(body) {
   const eventDate = String(body?.eventDate ?? body?.date ?? "").trim();
   const sports = Array.isArray(body?.sports) ? body.sports.map((s) => String(s)).filter((s) => SPORTS_META[s]) : [];
   const status = String(body?.status ?? "open").trim();
+  const regDeadlineRaw = String(body?.regDeadline ?? "").trim();
+  let regDeadline = null;
+  if (regDeadlineRaw) {
+    if (!Number.isFinite(Date.parse(regDeadlineRaw))) errors.regDeadline = "Registration deadline must be a valid date & time.";
+    else regDeadline = regDeadlineRaw;
+  }
   if (title.length < 3) errors.title = "Give the event a title (min 3 characters).";
   if (title.length > 120) errors.title = "Title must be 120 characters or fewer.";
   if (!EVENT_CATEGORIES.includes(category)) errors.category = `Pick a category: ${EVENT_CATEGORIES.join(", ")}.`;
   if (description.length > 2000) errors.description = "Description must be 2000 characters or fewer.";
   if (sports.length === 0) errors.sports = "Select at least one sport for this event.";
   if (status !== "open" && status !== "closed") errors.status = "Status must be open or closed.";
-  return { errors, clean: { title, category, description, venue: venue || null, eventDate: eventDate || null, sports, status } };
+  return { errors, clean: { title, category, description, venue: venue || null, eventDate: eventDate || null, sports, status, regDeadline } };
 }
 
 router.post("/sport-events", requireAdmin, async (req, res) => {
@@ -277,14 +303,14 @@ router.post("/teams", requireAuth, async (req, res) => {
       const gev = gSnap.val();
       if (!gev) return res.status(404).json({ ok: false, error: "Event not found." });
       if (gev.kind !== "team") return res.status(400).json({ ok: false, error: "This event takes individual registrations — no teams." });
-      if (gev.status !== "open") return res.status(400).json({ ok: false, error: "This event is closed for new teams." });
+      if (regClosed(gev)) return res.status(400).json({ ok: false, error: "Registrations are closed for this event." });
       meta = { min: gev.minPlayers, max: gev.maxPlayers, subs: 0 };
       isGeneral = true;
     } else {
       const evSnap = await rtdb().ref(`sportEvents/${eventId}`).get();
       const ev = evSnap.val();
       if (!ev) return res.status(404).json({ ok: false, error: "Event not found." });
-      if (ev.status !== "open") return res.status(400).json({ ok: false, error: "This event is closed for new teams." });
+      if (regClosed(ev)) return res.status(400).json({ ok: false, error: "Registrations are closed for this event." });
       if (!Array.isArray(ev.sports) || !ev.sports.includes(sportId)) {
         return res.status(400).json({ ok: false, error: "This sport is not part of the event." });
       }
@@ -328,6 +354,9 @@ router.post("/teams/:id/request", requireAuth, async (req, res) => {
     const snap = await rtdb().ref(`teams/${id}`).get();
     const t = snap.val();
     if (!t) return res.status(404).json({ ok: false, error: "Team not found." });
+    if (await eventRegClosed(t.eventId, t.sportId)) {
+      return res.status(400).json({ ok: false, error: "Registrations are closed for this event." });
+    }
     const pub = publicTeam(id, t);
     if (pub.locked) return res.status(400).json({ ok: false, error: "This team is locked — roster is full." });
     if (t.members && t.members[req.member.uid]) {
@@ -411,6 +440,10 @@ router.post("/teams/:id/requests/:uid", requireAuth, async (req, res) => {
     }
     // Approve: re-check everything at decision time.
     const fresh = (await rtdb().ref(`teams/${id}`).get()).val();
+    if (await eventRegClosed(fresh.eventId, fresh.sportId)) {
+      await rtdb().ref(`teamRequests/${id}/${targetUid}`).update({ status: "rejected", decidedAt: new Date().toISOString() });
+      return res.status(400).json({ ok: false, error: "Registrations are closed for this event." });
+    }
     const count = fresh.members ? Object.keys(fresh.members).length : 0;
     if (count >= fresh.maxPlayers) {
       await rtdb().ref(`teams/${id}`).update({ locked: true });
@@ -516,6 +549,12 @@ function validateGeneralEvent(body) {
   const venue = String(body?.venue ?? "").trim().slice(0, 120);
   const eventDate = String(body?.eventDate ?? body?.date ?? "").trim();
   const status = String(body?.status ?? "open").trim();
+  const regDeadlineRaw = String(body?.regDeadline ?? "").trim();
+  let regDeadline = null;
+  if (regDeadlineRaw) {
+    if (!Number.isFinite(Date.parse(regDeadlineRaw))) errors.regDeadline = "Registration deadline must be a valid date & time.";
+    else regDeadline = regDeadlineRaw;
+  }
   let fee = null;
   if (body?.fee !== undefined && body?.fee !== "" && body?.fee !== null) {
     fee = Number(body.fee);
@@ -538,7 +577,7 @@ function validateGeneralEvent(body) {
       errors.maxPlayers = "Maximum can't be smaller than the minimum.";
     }
   }
-  return { errors, clean: { title, kind, description, venue: venue || null, eventDate: eventDate || null, fee, minPlayers, maxPlayers, status } };
+  return { errors, clean: { title, kind, description, venue: venue || null, eventDate: eventDate || null, fee, minPlayers, maxPlayers, status, regDeadline } };
 }
 
 async function generalEventWithCount(id, ev) {
@@ -548,7 +587,7 @@ async function generalEventWithCount(id, ev) {
     const val = snap.val() || {};
     regCount = Object.keys(val).length;
   } catch { /* ignore */ }
-  return { id, ...ev, regCount };
+  return { id, ...ev, regCount, regClosed: regClosed(ev) };
 }
 
 // Public list (with registration headcounts, no names).
@@ -637,7 +676,7 @@ router.post("/general-events/:id/register", requireAuth, async (req, res) => {
     if (ev.kind !== "individual") {
       return res.status(400).json({ ok: false, error: "This is a team event — join or form a team instead." });
     }
-    if (ev.status !== "open") return res.status(400).json({ ok: false, error: "Registrations are closed for this event." });
+    if (regClosed(ev)) return res.status(400).json({ ok: false, error: "Registrations are closed for this event." });
     const existing = await rtdb().ref(`eventRegs/${id}/${req.member.uid}`).get();
     if (existing.exists()) return res.status(400).json({ ok: false, error: "You are already registered." });
     const name = await memberName(req.member.uid, req.member.name);
