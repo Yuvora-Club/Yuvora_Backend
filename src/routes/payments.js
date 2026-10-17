@@ -35,7 +35,7 @@ import crypto from "node:crypto";
 import QRCode from "qrcode";
 import { rtdb, isFirebaseReady } from "../firebase.js";
 import { requireAuth } from "../middleware/requireAuth.js";
-import { requirePayAdmin, signPaySession, isPayAdminOpen } from "../middleware/requirePayAdmin.js";
+import { requirePayAdmin, signPaySession } from "../middleware/requirePayAdmin.js";
 import { SPORTS_META } from "./sports.js";
 
 const router = Router();
@@ -557,11 +557,24 @@ router.post("/pay/orders/:orderId/utr", requireAuth, async (req, res) => {
 // ================= standalone pay-admin dashboard =================
 
 function adminPasswordConfigured() {
+  const plain = String(process.env.PAY_ADMIN_PASSWORD || "").trim();
+  if (plain && !plain.startsWith("PLACEHOLDER")) return true;
   const h = String(process.env.ADMIN_PASSWORD_HASH || "").trim();
   return !!h && !h.startsWith("PLACEHOLDER");
 }
 
 function verifyAdminPassword(password) {
+  // 1) Simple plaintext password from env: PAY_ADMIN_PASSWORD (Render + .env).
+  const plain = String(process.env.PAY_ADMIN_PASSWORD || "").trim();
+  if (plain && !plain.startsWith("PLACEHOLDER")) {
+    const a = Buffer.from(String(password || ""));
+    const b = Buffer.from(plain);
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+      return { ok: false, reason: "mismatch" };
+    }
+    return { ok: true };
+  }
+  // 2) Fallback: scrypt hash from ADMIN_PASSWORD_HASH (npm run pay:pass).
   const stored = String(process.env.ADMIN_PASSWORD_HASH || "").trim();
   if (!adminPasswordConfigured()) return { ok: false, reason: "not-configured" };
   const m = stored.match(/^scrypt\$([0-9a-f]+)\$([0-9a-f]+)$/i);
@@ -581,10 +594,6 @@ function verifyAdminPassword(password) {
 }
 
 router.post("/pay-admin/login", (req, res) => {
-  // TEMPORARY bypass: PAY_ADMIN_OPEN=true skips the password entirely.
-  if (isPayAdminOpen()) {
-    return res.json({ ok: true, token: signPaySession(), open: true });
-  }
   if (!rateLimit(`paylogin:${clientIp(req)}`, 8, 5 * 60_000)) {
     return res.status(429).json({ ok: false, error: "Too many login attempts — wait 5 minutes." });
   }

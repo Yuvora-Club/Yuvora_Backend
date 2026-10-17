@@ -1,7 +1,9 @@
 // Standalone payments-admin session — SEPARATE from the Firebase admin login.
 //
-// The payments dashboard is unlocked with ADMIN_PASSWORD_HASH (set via
-// `npm run pay:pass`) and receives a short-lived, HMAC-signed session token.
+// The payments dashboard password is read from env:
+//   PAY_ADMIN_PASSWORD  (simple plaintext — set on Render + local .env), or
+//   ADMIN_PASSWORD_HASH (scrypt hash via `npm run pay:pass`) as fallback.
+// On login the dashboard receives a short-lived, HMAC-signed session token.
 // The SPA keeps the token in sessionStorage and sends it as a Bearer header on
 // every /api/pay-admin/* call (cross-site cookie-free, so no CORS-credentials
 // or CSRF dance is needed). The token is stateless: payload + signature.
@@ -14,14 +16,8 @@ function sessionSecret() {
   return String(
     process.env.PAY_ADMIN_SECRET ||
       process.env.ADMIN_PASSWORD_HASH ||
+      process.env.PAY_ADMIN_PASSWORD ||
       "yuvora-pay-dev-secret"
-  );
-}
-
-/** TEMPORARY bypass — set PAY_ADMIN_OPEN=true to open /pay-admin with no password. */
-export function isPayAdminOpen() {
-  return ["1", "true", "yes", "open"].includes(
-    String(process.env.PAY_ADMIN_OPEN || "").trim().toLowerCase()
   );
 }
 
@@ -56,10 +52,6 @@ function verifyPaySession(token) {
 
 /** Gate for /api/pay-admin/* — attaches req.payAdmin on success. */
 export function requirePayAdmin(req, res, next) {
-  if (isPayAdminOpen()) {
-    req.payAdmin = { role: "payadmin", open: true };
-    return next();
-  }
   const header = req.headers.authorization || "";
   const token = header.startsWith("Bearer ") ? header.slice(7).trim() : "";
   const data = verifyPaySession(token);
