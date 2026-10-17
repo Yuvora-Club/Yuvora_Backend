@@ -15,6 +15,7 @@ function validate(body) {
   const fullName = String(body?.fullName ?? body?.name ?? "").trim();
   const email = String(body?.email ?? "").trim().toLowerCase();
   const altEmail = String(body?.altEmail ?? "").trim().toLowerCase();
+  const school = String(body?.school ?? "").trim();
   const phoneRaw = body?.phone ?? "";
   const ageNum = body?.age === "" || body?.age == null ? null : Number(body.age);
   const password = String(body?.password ?? "");
@@ -25,6 +26,8 @@ function validate(body) {
   if (!EMAIL_RE.test(email)) errors.email = "Enter a valid email address.";
   if (altEmail && !EMAIL_RE.test(altEmail)) errors.altEmail = "Alternate email looks invalid.";
   else if (altEmail && altEmail === email) errors.altEmail = "Alternate email must differ from primary email.";
+  if (school.length < 2) errors.school = "Please tell us your school.";
+  else if (school.length > 120) errors.school = "School name is too long.";
 
   const phone = cleanPhone(phoneRaw);
   if (!phoneRaw || !phone) errors.phone = "Enter a 10-digit contact number.";
@@ -38,7 +41,7 @@ function validate(body) {
 
   return {
     errors,
-    clean: { fullName, email, altEmail: altEmail || null, phone, age: ageNum, password, accepted },
+    clean: { fullName, email, altEmail: altEmail || null, school, phone, age: ageNum, password, accepted },
   };
 }
 
@@ -84,6 +87,7 @@ router.post("/register", async (req, res) => {
       fullName: clean.fullName,
       email: clean.email,
       altEmail: clean.altEmail,
+      school: clean.school,
       phone: clean.phone,
       age: clean.age,
       birthDate: null,

@@ -40,11 +40,14 @@ function validateNewAdmin(body) {
   const errors = {};
   const fullName = String(body?.fullName ?? body?.name ?? "").trim();
   const email = String(body?.email ?? "").trim().toLowerCase();
+  const school = String(body?.school ?? "").trim();
   const phone = cleanPhone(body?.phone ?? "");
   const birthDate = String(body?.birthDate ?? "").trim();
   const password = String(body?.password ?? "");
   if (fullName.length < 2) errors.fullName = "Please enter the admin's full name.";
   if (!EMAIL_RE.test(email)) errors.email = "Enter a valid email address.";
+  if (school.length < 2) errors.school = "Please tell us their school.";
+  else if (school.length > 120) errors.school = "School name is too long.";
   if (!phone) errors.phone = "Enter a 10-digit contact number.";
   let age = null;
   if (birthDate) {
@@ -58,7 +61,7 @@ function validateNewAdmin(body) {
     errors.birthDate = "Give a birth date (age is computed from it).";
   }
   if (!password || password.length < 8) errors.password = "Password needs at least 8 characters.";
-  return { errors, clean: { fullName, email, phone, birthDate: birthDate || null, age, password } };
+  return { errors, clean: { fullName, email, school, phone, birthDate: birthDate || null, age, password } };
 }
 
 function publicProfile(uid, p) {
@@ -68,6 +71,7 @@ function publicProfile(uid, p) {
     uid,
     fullName: p.fullName || "",
     email: p.email || "",
+    school: p.school || "",
     phone: p.phone || "",
     birthDate: p.birthDate || null,
     age: p.birthDate ? ageFromBirthDate(p.birthDate) ?? p.age ?? null : (p.age ?? null),
@@ -138,6 +142,7 @@ router.post("/users", async (req, res) => {
       fullName: clean.fullName,
       email: clean.email,
       altEmail: null,
+      school: clean.school,
       phone: clean.phone,
       birthDate: clean.birthDate,
       age: clean.age,
