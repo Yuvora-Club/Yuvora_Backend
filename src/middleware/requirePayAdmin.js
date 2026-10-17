@@ -18,6 +18,13 @@ function sessionSecret() {
   );
 }
 
+/** TEMPORARY bypass — set PAY_ADMIN_OPEN=true to open /pay-admin with no password. */
+export function isPayAdminOpen() {
+  return ["1", "true", "yes", "open"].includes(
+    String(process.env.PAY_ADMIN_OPEN || "").trim().toLowerCase()
+  );
+}
+
 function sign(payload) {
   return crypto.createHmac("sha256", sessionSecret()).update(payload).digest("base64url");
 }
@@ -49,6 +56,10 @@ function verifyPaySession(token) {
 
 /** Gate for /api/pay-admin/* — attaches req.payAdmin on success. */
 export function requirePayAdmin(req, res, next) {
+  if (isPayAdminOpen()) {
+    req.payAdmin = { role: "payadmin", open: true };
+    return next();
+  }
   const header = req.headers.authorization || "";
   const token = header.startsWith("Bearer ") ? header.slice(7).trim() : "";
   const data = verifyPaySession(token);

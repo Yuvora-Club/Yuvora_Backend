@@ -35,7 +35,7 @@ import crypto from "node:crypto";
 import QRCode from "qrcode";
 import { rtdb, isFirebaseReady } from "../firebase.js";
 import { requireAuth } from "../middleware/requireAuth.js";
-import { requirePayAdmin, signPaySession } from "../middleware/requirePayAdmin.js";
+import { requirePayAdmin, signPaySession, isPayAdminOpen } from "../middleware/requirePayAdmin.js";
 import { SPORTS_META } from "./sports.js";
 
 const router = Router();
@@ -581,6 +581,10 @@ function verifyAdminPassword(password) {
 }
 
 router.post("/pay-admin/login", (req, res) => {
+  // TEMPORARY bypass: PAY_ADMIN_OPEN=true skips the password entirely.
+  if (isPayAdminOpen()) {
+    return res.json({ ok: true, token: signPaySession(), open: true });
+  }
   if (!rateLimit(`paylogin:${clientIp(req)}`, 8, 5 * 60_000)) {
     return res.status(429).json({ ok: false, error: "Too many login attempts — wait 5 minutes." });
   }

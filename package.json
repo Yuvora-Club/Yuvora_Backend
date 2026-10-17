@@ -13,7 +13,8 @@
     "prune": "node scripts/pruneAccounts.js",
     "test": "node --test",
     "pay:pass": "node scripts/setPayAdminPassword.js",
-    "pay:expire": "node scripts/expireOrders.js"
+    "pay:expire": "node scripts/expireOrders.js",
+    "pay:dump": "node scripts/dumpPayOrders.js",
   },
   "dependencies": {
     "cors": "^2.8.5",
