@@ -146,13 +146,39 @@ function validateEvent(body) {
     if (!Number.isFinite(Date.parse(regDeadlineRaw))) errors.regDeadline = "Registration deadline must be a valid date & time.";
     else regDeadline = regDeadlineRaw;
   }
+  // Per-event entry fee (used by the manual-UPI team payments). Optional —
+  // falls back to ENTRY_FEE_PER_TEAM when unset.
+  let entryFee = null;
+  if (body?.entryFee !== undefined && body?.entryFee !== "" && body?.entryFee !== null) {
+    entryFee = Number(body.entryFee);
+    if (!Number.isFinite(entryFee) || entryFee < 0 || entryFee > 1000000) errors.entryFee = "Entry fee must be between 0 and 1000000 (or leave it empty).";
+    else entryFee = Math.round(entryFee);
+  }
+  // Optional per-sport overrides, e.g. { volleyball: 1200, cricket: 1500 }.
+  let sportFees = null;
+  if (body?.sportFees && typeof body.sportFees === "object") {
+    const out = {};
+    for (const [k, v] of Object.entries(body.sportFees)) {
+      if (!SPORTS_META[k]) continue;
+      const n = Number(v);
+      if (Number.isFinite(n) && n >= 0) out[k] = Math.round(n);
+    }
+    sportFees = Object.keys(out).length > 0 ? out : null;
+  }
+  // Optional cap on paid team slots (overrides MAX_TEAMS for this event).
+  let maxTeams = null;
+  if (body?.maxTeams !== undefined && body?.maxTeams !== "" && body?.maxTeams !== null) {
+    maxTeams = Number(body.maxTeams);
+    if (!Number.isFinite(maxTeams) || maxTeams < 1 || maxTeams > 1000) errors.maxTeams = "Team cap must be between 1 and 1000.";
+    else maxTeams = Math.floor(maxTeams);
+  }
   if (title.length < 3) errors.title = "Give the event a title (min 3 characters).";
   if (title.length > 120) errors.title = "Title must be 120 characters or fewer.";
   if (!EVENT_CATEGORIES.includes(category)) errors.category = `Pick a category: ${EVENT_CATEGORIES.join(", ")}.`;
   if (description.length > 2000) errors.description = "Description must be 2000 characters or fewer.";
   if (sports.length === 0) errors.sports = "Select at least one sport for this event.";
   if (status !== "open" && status !== "closed") errors.status = "Status must be open or closed.";
-  return { errors, clean: { title, category, description, venue: venue || null, eventDate: eventDate || null, sports, status, regDeadline } };
+  return { errors, clean: { title, category, description, venue: venue || null, eventDate: eventDate || null, sports, status, regDeadline, entryFee, sportFees, maxTeams } };
 }
 
 router.post("/sport-events", requireAdmin, async (req, res) => {

@@ -10,13 +10,17 @@
     "start": "node src/index.js",
     "seed:admin": "node scripts/seedAdmin.js",
     "seed:reset": "node scripts/resetDatabase.js",
-    "prune": "node scripts/pruneAccounts.js"
+    "prune": "node scripts/pruneAccounts.js",
+    "test": "node --test",
+    "pay:pass": "node scripts/setPayAdminPassword.js",
+    "pay:expire": "node scripts/expireOrders.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.21.2",
-    "firebase-admin": "^12.7.0"
+    "firebase-admin": "^12.7.0",
+    "qrcode": "^1.5.4"
   },
   "engines": {
     "node": ">=20"

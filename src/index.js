@@ -6,6 +6,7 @@ import authRoutes from "./routes/auth.js";
 import announcementRoutes from "./routes/announcements.js";
 import adminRoutes from "./routes/admin.js";
 import sportsRoutes from "./routes/sports.js";
+import paymentRoutes from "./routes/payments.js";
 
 const app = express();
 const PORT = Number(process.env.PORT || 4000);
@@ -56,6 +57,7 @@ app.use("/api/auth", authRoutes);
 app.use("/api/announcements", announcementRoutes);
 app.use("/api/admin", adminRoutes);
 app.use("/api", sportsRoutes);
+app.use("/api", paymentRoutes);
 
 app.use((req, res) => {
   res.status(404).json({ ok: false, error: `No route: ${req.method} ${req.path}` });
