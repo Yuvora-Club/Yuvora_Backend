@@ -1,14 +1,14 @@
 // Sports system — events, teams, captain-approved joining, auto-lock.
 //
 //   Public : GET /api/sports/meta, GET /api/sport-events
-//   Admin  : POST/PUT/DELETE /api/sport-events[/:id]
+//   Admin  : POST/PUT/DELETE /api/sport-events[/:id], PUT /api/teams/:id/paid
 //   Members: GET /api/teams?eventId&sportId, POST /api/teams (create, self=captain)
 //            POST /api/teams/:id/request (ask captain), GET my teams/requests,
 //            captain approve/reject, leave, delete.
 //
 // Storage (Realtime Database):
 //   sportEvents/{id}            event shell (admin-made)
-//   teams/{id}                  { eventId, sportId, name, captainUid, members:{uid:{...}}, locked }
+//   teams/{id}                  { eventId, sportId, name, captainUid, members:{uid:{...}}, locked, paid }
 //   teamRequests/{teamId}/{uid} { name, status: pending|approved|rejected }
 
 import { Router } from "express";
@@ -203,6 +203,8 @@ function publicTeam(id, t) {
     minPlayers: t.minPlayers,
     maxPlayers: t.maxPlayers,
     subs: t.subs,
+    paid: t.paid === true,
+    paidAt: t.paidAt || null,
     status: teamStatus({ ...t, members }),
     locked: teamStatus({ ...t, members }) === "locked",
     createdAt: t.createdAt,
@@ -306,6 +308,7 @@ router.post("/teams", requireAuth, async (req, res) => {
       minPlayers: meta.min,
       maxPlayers: meta.max,
       subs: meta.subs,
+      paid: false,
       createdAt: now,
     };
     // Solo-sport edge (badminton singles): a 1-max roster fills instantly.
@@ -477,6 +480,27 @@ router.delete("/teams/:id", requireAuth, async (req, res) => {
   } catch (err) {
     console.error("DELETE /api/teams/:id failed:", err?.message || err);
     return res.status(500).json({ ok: false, error: "Could not delete the team." });
+  }
+});
+
+// Mark a team's entry fee as paid/unpaid — admin-only bookkeeping.
+router.put("/teams/:id/paid", requireAdmin, async (req, res) => {
+  const id = String(req.params.id || "").trim();
+  const paid = req.body?.paid === true;
+  try {
+    const ref = rtdb().ref(`teams/${id}`);
+    const snap = await ref.get();
+    if (!snap.exists()) return res.status(404).json({ ok: false, error: "Team not found." });
+    await ref.update({
+      paid,
+      paidAt: paid ? new Date().toISOString() : null,
+      paidBy: paid ? req.admin.uid : null,
+    });
+    const t = (await ref.get()).val();
+    return res.json({ ok: true, team: publicTeam(id, t) });
+  } catch (err) {
+    console.error("PUT /api/teams/:id/paid failed:", err?.message || err);
+    return res.status(500).json({ ok: false, error: "Could not update the team payment." });
   }
 });
 
