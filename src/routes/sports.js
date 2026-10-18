@@ -761,4 +761,49 @@ router.get("/my-registrations", requireAuth, async (req, res) => {
   }
 });
 
+// My seed-pass code — the dashboard fetches this live so it never shows a
+// stale or browser-hashed code. Mints on first read for pre-existing members.
+router.get("/my-seedpass", requireAuth, async (req, res) => {
+  try {
+    const userRef = rtdb().ref(`users/${req.member.uid}`);
+    const snap = await userRef.get();
+    const profile = snap.val();
+    if (!profile) return res.status(404).json({ ok: false, error: "Profile not found." });
+    let code = String(profile.seedPassCode || "").trim().toUpperCase();
+    if (!/^YV-\d{4}$/.test(code)) {
+      // Mint: deterministic from uid, bump on collision.
+      let h = 0x811c9dc5;
+      const s = String(req.member.uid || "");
+      for (let i = 0; i < s.length; i++) {
+        h ^= s.charCodeAt(i);
+        h = Math.imul(h, 0x01000193) >>> 0;
+      }
+      let num = (h % 9000) + 1000;
+      code = "";
+      for (let tries = 0; tries < 9000; tries++) {
+        const candidate = `YV-${String(num)}`;
+        const idx = await rtdb().ref(`seedPassIndex/${candidate}`).get();
+        const val = idx.val();
+        if (!val || val.uid === req.member.uid) {
+          code = candidate;
+          break;
+        }
+        num = num >= 9999 ? 1000 : num + 1;
+      }
+      if (!code) return res.status(500).json({ ok: false, error: "Could not mint a pass code." });
+      await userRef.update({ seedPassCode: code });
+      await rtdb().ref(`seedPassIndex/${code}`).set({ uid: req.member.uid });
+    } else {
+      try {
+        const idx = await rtdb().ref(`seedPassIndex/${code}`).get();
+        if (!idx.exists()) await rtdb().ref(`seedPassIndex/${code}`).set({ uid: req.member.uid });
+      } catch { /* index repair is best-effort */ }
+    }
+    return res.json({ ok: true, code });
+  } catch (err) {
+    console.error("GET /api/my-seedpass failed:", err?.message || err);
+    return res.status(500).json({ ok: false, error: "Could not load your seed pass." });
+  }
+});
+
 export default router;
