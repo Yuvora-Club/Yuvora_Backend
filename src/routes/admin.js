@@ -64,17 +64,19 @@ function validateNewAdmin(body) {
   return { errors, clean: { fullName, email, school, phone, birthDate: birthDate || null, age, password } };
 }
 
-// Seed passes — gate verification for raves / socials.
+// Seed passes — membership check for the Verify tab (gate / social entry).
 // Every member gets a stable `seedPassCode` (format YV-XXXX, e.g. YV-8930)
-// minted at registration. Admins verify + consume it at the gate.
+// minted at registration. The admin types it in: the endpoint is a pure READ —
+// does this person belong, who are they, which events are they registered in.
+// Nothing is ever written here (no scan/marking log).
 //
 // Storage (Realtime Database):
 //   users/{uid}.seedPassCode            stable per-member code (YV-XXXX)
-//   seedPassIndex/{CODE} -> { uid }     reverse lookup for instant gate verify
-//   seedPassScans/{pushId}              audit log of gate scans
+//   seedPassIndex/{CODE} -> { uid }     reverse lookup for instant verify
+//   eventRegs/{eventId}/{uid}           individual event registrations
+//   teams/{teamId}.members/{uid}        team rosters (sport + general teams)
 // Routes (all requireAdmin):
-//   POST /api/admin/seedpass/verify { code }  -> member profile + scan history
-//   POST /api/admin/seedpass/consume { code, note? } -> marks used (idempotent-ish, logs every scan)
+//   POST /api/admin/seedpass/verify { code }  -> member profile + registered events
 
 function seedPassCodeFromUid(uid) {
   // Stable + deterministic so re-reads never rotate a member's printed code.
@@ -120,22 +122,58 @@ async function ensureSeedPassCode(uid) {
   return null;
 }
 
-// Gate scan history for a code. Deliberately a plain ref().get() + JS filter
-// instead of orderByChild().equalTo().get(): the chained Query.get() is not
-// present on every firebase-admin build (Reference.get() always is), and an
-// unindexed child query needs a declared .indexOn. History is non-critical —
-// a failure here must never fail a verify/consume.
-async function scansForCode(code) {
+// Every event a member is registered in. Two sources, both plain ref().get()
+// + JS filter (never chained orderByChild().equalTo() queries — those hard-
+// throw without declared .indexOn rules). Read-only and non-critical: a
+// failure here returns null and must never fail a verify.
+//   eventRegs/{eventId}/{uid}        individual entries (general events)
+//   teams/{teamId}.members/{uid}     team rosters (sport events + general teams)
+async function memberRegisteredEvents(uid) {
   try {
-    const snap = await rtdb().ref("seedPassScans").get();
-    const all = snap.val() || {};
-    return Object.entries(all)
-      .filter(([, s]) => String(s?.code || "").trim().toUpperCase() === code)
-      .map(([id, s]) => ({ id, ...s }))
-      .sort((a, b) => String(b.at || "").localeCompare(String(a.at || "")));
+    const [regsSnap, teamsSnap, gevsSnap, sevsSnap] = await Promise.all([
+      rtdb().ref("eventRegs").get(),
+      rtdb().ref("teams").get(),
+      rtdb().ref("generalEvents").get(),
+      rtdb().ref("sportEvents").get(),
+    ]);
+    const regs = regsSnap.val() || {};
+    const teams = teamsSnap.val() || {};
+    const generalEvents = gevsSnap.val() || {};
+    const sportEvents = sevsSnap.val() || {};
+    const events = [];
+    for (const [eventId, byUser] of Object.entries(regs)) {
+      const mine = byUser && byUser[uid];
+      if (!mine) continue;
+      events.push({
+        eventId,
+        name: generalEvents[eventId]?.title || eventId,
+        type: "individual",
+        sport: null,
+        teamName: null,
+        teamId: null,
+        when: mine.registeredAt || null,
+      });
+    }
+    for (const [teamId, t] of Object.entries(teams)) {
+      const me = t?.members && t.members[uid];
+      if (!me) continue;
+      const isGeneral = String(t.sportId || "") === "general";
+      const ev = isGeneral ? generalEvents[t.eventId] : sportEvents[t.eventId];
+      events.push({
+        eventId: t.eventId,
+        name: ev?.title || t.eventId,
+        type: "team",
+        sport: isGeneral ? null : t.sportId || null,
+        teamName: t.name || null,
+        teamId,
+        when: me.joinedAt || t.createdAt || null,
+      });
+    }
+    events.sort((a, b) => String(b.when || "").localeCompare(String(a.when || "")));
+    return events;
   } catch (err) {
-    console.warn("[seedpass] scans load failed:", err?.message || err);
-    return [];
+    console.warn("[seedpass] registrations load failed:", err?.message || err);
+    return null;
   }
 }
 
@@ -326,8 +364,9 @@ router.put("/profile", async (req, res) => {
   }
 });
 
-// ---- Seed-pass gate (Verify tab in /admin) ----
-// POST /api/admin/seedpass/verify { code } -> member profile + scan history.
+// ---- Seed-pass Verify tab in /admin ----
+// POST /api/admin/seedpass/verify { code } -> membership check: profile +
+// every event the member is registered in. Read-only; nothing is written.
 // Code format: YV-XXXX (case-insensitive, dash optional). Mint-on-first-verify
 // so members who joined before this feature still get a stable code.
 router.post("/seedpass/verify", async (req, res) => {
@@ -367,103 +406,29 @@ router.post("/seedpass/verify", async (req, res) => {
       console.warn(`[seedpass] verify miss: ${code} — not in seedPassIndex nor any users/*.`);
       return res.status(404).json({
         ok: false,
-        error: `No member found for ${code}. If this member's dashboard shows this code, the backend serving the dashboard and this one are using different databases.`,
+        error: `No member found for ${code} — this code does not belong to any member.`,
       });
     }
     const codeNow = await ensureSeedPassCode(uid);
     const profSnap = await rtdb().ref(`users/${uid}`).get();
     const profile = profSnap.val();
     if (!profile) return res.status(404).json({ ok: false, error: `No member found for ${code}.` });
-    // Recent scans for this code (same gate, any admin).
-    const scans = (await scansForCode(code)).slice(0, 10);
+    // Every event this member is registered in (individual + team rosters).
+    // null = lookup failed (eventsError explains); the membership answer itself
+    // still succeeds either way.
+    const events = await memberRegisteredEvents(uid);
     return res.json({
       ok: true,
-      pass: {
-        code: codeNow || code,
-        status: scans.length > 0 ? "scanned" : "active",
-        scanCount: scans.length,
-      },
+      code: codeNow || code,
       member: { ...publicProfile(uid, profile), seedPassCode: codeNow || code },
-      scans,
+      events: Array.isArray(events) ? events : null,
+      eventsError: Array.isArray(events) ? null : "Registrations could not be loaded — try again.",
     });
   } catch (err) {
     console.error("POST /api/admin/seedpass/verify failed:", err?.stack || err?.message || err);
     return res.status(500).json({
       ok: false,
       error: "Could not verify that code. Try again.",
-      detail: err?.message || String(err),
-    });
-  }
-});
-
-// POST /api/admin/seedpass/consume { code, note? } -> logs a gate entry scan.
-// Every scan is logged; the response tells the gate if this code was already
-// scanned before (possible double-use) so the admin can decide.
-router.post("/seedpass/consume", async (req, res) => {
-  const raw = String(req.body?.code || "").trim().toUpperCase().replace(/\s+/g, "");
-  const note = String(req.body?.note || "").trim().slice(0, 200);
-  const m = raw.match(/^YV-?(\d{3,6})$/);
-  if (!m) return res.status(400).json({ ok: false, error: "Enter a seed-pass code like YV-8930." });
-  const code = `YV-${m[1].padStart(4, "0").slice(-4)}`;
-  if (!isFirebaseReady()) {
-    return res.status(503).json({ ok: false, error: "Firebase is not configured on the backend yet." });
-  }
-  try {
-    // Resolve the member the same resilient way as verify: trust the reverse
-    // index only if that member still exists, else sweep users for the code.
-    let uid = null;
-    const idxSnap = await rtdb().ref(`seedPassIndex/${code}`).get();
-    const idxUid = idxSnap.val()?.uid || null;
-    if (idxUid) {
-      const prof = await rtdb().ref(`users/${idxUid}`).get();
-      if (prof.exists()) uid = idxUid;
-    }
-    if (!uid) {
-      const usersSnap = await rtdb().ref("users").get();
-      const users = usersSnap.val() || {};
-      for (const [id, p] of Object.entries(users)) {
-        if (String(p?.seedPassCode || "").trim().toUpperCase() === code) {
-          uid = id;
-          try {
-            await rtdb().ref(`seedPassIndex/${code}`).set({ uid: id });
-          } catch { /* index repair is best-effort */ }
-          break;
-        }
-      }
-    }
-    if (!uid) {
-      console.warn(`[seedpass] consume miss: ${code} — not in seedPassIndex nor any users/*.`);
-      return res.status(404).json({ ok: false, error: `No member found for ${code}.` });
-    }
-    const codeNow = await ensureSeedPassCode(uid);
-    const profSnap = await rtdb().ref(`users/${uid}`).get();
-    const profile = profSnap.val();
-    if (!profile) return res.status(404).json({ ok: false, error: `No member found for ${code}.` });
-    const priorCount = (await scansForCode(code)).length;
-    const at = new Date().toISOString();
-    await rtdb().ref("seedPassScans").push({
-      code,
-      uid,
-      by: req.admin.uid,
-      at,
-      note: note || null,
-    });
-    return res.json({
-      ok: true,
-      pass: {
-        code: codeNow || code,
-        status: "scanned",
-        scanCount: priorCount + 1,
-        alreadyScanned: priorCount > 0,
-        at,
-      },
-      member: { ...publicProfile(uid, profile), seedPassCode: codeNow || code },
-    });
-  } catch (err) {
-    console.error("POST /api/admin/seedpass/consume failed:", err?.stack || err?.message || err);
-    return res.status(500).json({
-      ok: false,
-      error: "Could not record that scan. Try again.",
       detail: err?.message || String(err),
     });
   }
