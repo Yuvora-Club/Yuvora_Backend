@@ -317,21 +317,37 @@ router.post("/seedpass/verify", async (req, res) => {
   if (!m) return res.status(400).json({ ok: false, error: "Enter a seed-pass code like YV-8930." });
   const code = `YV-${m[1].padStart(4, "0").slice(-4)}`;
   try {
+    // 1) Reverse index (fast path).
+    let uid = null;
     const idxSnap = await rtdb().ref(`seedPassIndex/${code}`).get();
-    let uid = idxSnap.val()?.uid || null;
+    const idxUid = idxSnap.val()?.uid || null;
+    if (idxUid) {
+      const prof = await rtdb().ref(`users/${idxUid}`).get();
+      // Only trust the index if that member still exists (guards against
+      // pruned users leaving a dangling index entry that would 404).
+      if (prof.exists()) uid = idxUid;
+    }
+    // 2) Fallback — sweep users for a stored code (also repairs the index).
     if (!uid) {
-      // No index yet — sweep users for a stored code (backfill), else not found.
       const usersSnap = await rtdb().ref("users").get();
       const users = usersSnap.val() || {};
       for (const [id, p] of Object.entries(users)) {
         if (String(p?.seedPassCode || "").trim().toUpperCase() === code) {
           uid = id;
-          await rtdb().ref(`seedPassIndex/${code}`).set({ uid });
+          try {
+            await rtdb().ref(`seedPassIndex/${code}`).set({ uid: id });
+          } catch { /* index repair is best-effort */ }
           break;
         }
       }
     }
-    if (!uid) return res.status(404).json({ ok: false, error: `No member found for ${code}.` });
+    if (!uid) {
+      console.warn(`[seedpass] verify miss: ${code} — not in seedPassIndex nor any users/*.`);
+      return res.status(404).json({
+        ok: false,
+        error: `No member found for ${code}. If this member's dashboard shows this code, the backend serving the dashboard and this one are using different databases.`,
+      });
+    }
     const codeNow = await ensureSeedPassCode(uid);
     const profSnap = await rtdb().ref(`users/${uid}`).get();
     const profile = profSnap.val();
@@ -369,9 +385,32 @@ router.post("/seedpass/consume", async (req, res) => {
   if (!m) return res.status(400).json({ ok: false, error: "Enter a seed-pass code like YV-8930." });
   const code = `YV-${m[1].padStart(4, "0").slice(-4)}`;
   try {
+    // Resolve the member the same resilient way as verify: trust the reverse
+    // index only if that member still exists, else sweep users for the code.
+    let uid = null;
     const idxSnap = await rtdb().ref(`seedPassIndex/${code}`).get();
-    const uid = idxSnap.val()?.uid || null;
-    if (!uid) return res.status(404).json({ ok: false, error: `No member found for ${code}.` });
+    const idxUid = idxSnap.val()?.uid || null;
+    if (idxUid) {
+      const prof = await rtdb().ref(`users/${idxUid}`).get();
+      if (prof.exists()) uid = idxUid;
+    }
+    if (!uid) {
+      const usersSnap = await rtdb().ref("users").get();
+      const users = usersSnap.val() || {};
+      for (const [id, p] of Object.entries(users)) {
+        if (String(p?.seedPassCode || "").trim().toUpperCase() === code) {
+          uid = id;
+          try {
+            await rtdb().ref(`seedPassIndex/${code}`).set({ uid: id });
+          } catch { /* index repair is best-effort */ }
+          break;
+        }
+      }
+    }
+    if (!uid) {
+      console.warn(`[seedpass] consume miss: ${code} — not in seedPassIndex nor any users/*.`);
+      return res.status(404).json({ ok: false, error: `No member found for ${code}.` });
+    }
     const codeNow = await ensureSeedPassCode(uid);
     const profSnap = await rtdb().ref(`users/${uid}`).get();
     const profile = profSnap.val();
