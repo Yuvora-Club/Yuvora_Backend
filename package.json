@@ -14,7 +14,8 @@
     "test": "node --test",
     "pay:pass": "node scripts/setPayAdminPassword.js",
     "pay:expire": "node scripts/expireOrders.js",
-    "pay:dump": "node scripts/dumpPayOrders.js"
+    "pay:dump": "node scripts/dumpPayOrders.js",
+    "seedpass:backfill": "node scripts/backfillSeedPass.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
