@@ -15,7 +15,8 @@
     "pay:pass": "node scripts/setPayAdminPassword.js",
     "pay:expire": "node scripts/expireOrders.js",
     "pay:dump": "node scripts/dumpPayOrders.js",
-    "seedpass:backfill": "node scripts/backfillSeedPass.js"
+    "seedpass:backfill": "node scripts/backfillSeedPass.js",
+    "seedpass:diag": "node scripts/diagSeedPass.js"
   },
   "dependencies": {
     "cors": "^2.8.5",

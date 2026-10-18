@@ -120,6 +120,25 @@ async function ensureSeedPassCode(uid) {
   return null;
 }
 
+// Gate scan history for a code. Deliberately a plain ref().get() + JS filter
+// instead of orderByChild().equalTo().get(): the chained Query.get() is not
+// present on every firebase-admin build (Reference.get() always is), and an
+// unindexed child query needs a declared .indexOn. History is non-critical —
+// a failure here must never fail a verify/consume.
+async function scansForCode(code) {
+  try {
+    const snap = await rtdb().ref("seedPassScans").get();
+    const all = snap.val() || {};
+    return Object.entries(all)
+      .filter(([, s]) => String(s?.code || "").trim().toUpperCase() === code)
+      .map(([id, s]) => ({ id, ...s }))
+      .sort((a, b) => String(b.at || "").localeCompare(String(a.at || "")));
+  } catch (err) {
+    console.warn("[seedpass] scans load failed:", err?.message || err);
+    return [];
+  }
+}
+
 function publicProfile(uid, p) {
   if (!p) return null;
   return {
@@ -316,6 +335,9 @@ router.post("/seedpass/verify", async (req, res) => {
   const m = raw.match(/^YV-?(\d{3,6})$/);
   if (!m) return res.status(400).json({ ok: false, error: "Enter a seed-pass code like YV-8930." });
   const code = `YV-${m[1].padStart(4, "0").slice(-4)}`;
+  if (!isFirebaseReady()) {
+    return res.status(503).json({ ok: false, error: "Firebase is not configured on the backend yet." });
+  }
   try {
     // 1) Reverse index (fast path).
     let uid = null;
@@ -353,12 +375,7 @@ router.post("/seedpass/verify", async (req, res) => {
     const profile = profSnap.val();
     if (!profile) return res.status(404).json({ ok: false, error: `No member found for ${code}.` });
     // Recent scans for this code (same gate, any admin).
-    const scansSnap = await rtdb().ref("seedPassScans").orderByChild("code").equalTo(code).get();
-    const scansVal = scansSnap.val() || {};
-    const scans = Object.entries(scansVal)
-      .map(([id, s]) => ({ id, ...s }))
-      .sort((a, b) => String(b.at || "").localeCompare(String(a.at || "")))
-      .slice(0, 10);
+    const scans = (await scansForCode(code)).slice(0, 10);
     return res.json({
       ok: true,
       pass: {
@@ -370,8 +387,12 @@ router.post("/seedpass/verify", async (req, res) => {
       scans,
     });
   } catch (err) {
-    console.error("POST /api/admin/seedpass/verify failed:", err?.message || err);
-    return res.status(500).json({ ok: false, error: "Could not verify that code. Try again." });
+    console.error("POST /api/admin/seedpass/verify failed:", err?.stack || err?.message || err);
+    return res.status(500).json({
+      ok: false,
+      error: "Could not verify that code. Try again.",
+      detail: err?.message || String(err),
+    });
   }
 });
 
@@ -384,6 +405,9 @@ router.post("/seedpass/consume", async (req, res) => {
   const m = raw.match(/^YV-?(\d{3,6})$/);
   if (!m) return res.status(400).json({ ok: false, error: "Enter a seed-pass code like YV-8930." });
   const code = `YV-${m[1].padStart(4, "0").slice(-4)}`;
+  if (!isFirebaseReady()) {
+    return res.status(503).json({ ok: false, error: "Firebase is not configured on the backend yet." });
+  }
   try {
     // Resolve the member the same resilient way as verify: trust the reverse
     // index only if that member still exists, else sweep users for the code.
@@ -415,8 +439,7 @@ router.post("/seedpass/consume", async (req, res) => {
     const profSnap = await rtdb().ref(`users/${uid}`).get();
     const profile = profSnap.val();
     if (!profile) return res.status(404).json({ ok: false, error: `No member found for ${code}.` });
-    const priorSnap = await rtdb().ref("seedPassScans").orderByChild("code").equalTo(code).get();
-    const priorCount = priorSnap.val() ? Object.keys(priorSnap.val()).length : 0;
+    const priorCount = (await scansForCode(code)).length;
     const at = new Date().toISOString();
     await rtdb().ref("seedPassScans").push({
       code,
@@ -437,8 +460,12 @@ router.post("/seedpass/consume", async (req, res) => {
       member: { ...publicProfile(uid, profile), seedPassCode: codeNow || code },
     });
   } catch (err) {
-    console.error("POST /api/admin/seedpass/consume failed:", err?.message || err);
-    return res.status(500).json({ ok: false, error: "Could not record that scan. Try again." });
+    console.error("POST /api/admin/seedpass/consume failed:", err?.stack || err?.message || err);
+    return res.status(500).json({
+      ok: false,
+      error: "Could not record that scan. Try again.",
+      detail: err?.message || String(err),
+    });
   }
 });
 
