@@ -72,7 +72,8 @@ function validateNewAdmin(body) {
 //
 // Storage (Realtime Database):
 //   users/{uid}.seedPassCode            stable per-member code (YV-XXXX)
-//   seedPassIndex/{CODE} -> { uid }     reverse lookup for instant verify
+//   seedPassIndex/{CODE}                reverse lookup, self-describing:
+//                                       { uid, fullName, email, updatedAt }
 //   eventRegs/{eventId}/{uid}           individual event registrations
 //   teams/{teamId}.members/{uid}        team rosters (sport + general teams)
 // Routes (all requireAdmin):
@@ -96,12 +97,28 @@ async function ensureSeedPassCode(uid) {
   const snap = await userRef.get();
   const profile = snap.val();
   if (!profile) return null;
+  const who = {
+    uid,
+    fullName: String(profile.fullName || profile.name || ""),
+    email: String(profile.email || "").toLowerCase(),
+    updatedAt: new Date().toISOString(),
+  };
   let code = String(profile.seedPassCode || "").trim().toUpperCase();
   if (/^YV-\d{4}$/.test(code)) {
-    // Repair the reverse index if missing.
+    // Repair the reverse index if missing — or top up an old anonymous
+    // { uid } entry with the owner's name+email so the index stays
+    // self-describing.
     try {
       const idx = await rtdb().ref(`seedPassIndex/${code}`).get();
-      if (!idx.exists()) await rtdb().ref(`seedPassIndex/${code}`).set({ uid });
+      const val = idx.val();
+      if (!val) await rtdb().ref(`seedPassIndex/${code}`).set(who);
+      else if (val.uid === uid && (!val.fullName || !val.email)) {
+        await rtdb().ref(`seedPassIndex/${code}`).update({
+          fullName: who.fullName,
+          email: who.email,
+          updatedAt: who.updatedAt,
+        });
+      }
     } catch { /* index repair is best-effort */ }
     return code;
   }
@@ -114,7 +131,7 @@ async function ensureSeedPassCode(uid) {
     const val = idx.val();
     if (!val || val.uid === uid) {
       await userRef.update({ seedPassCode: candidate });
-      await rtdb().ref(`seedPassIndex/${candidate}`).set({ uid });
+      await rtdb().ref(`seedPassIndex/${candidate}`).set(who);
       return candidate;
     }
     num = num >= 9999 ? 1000 : num + 1;
@@ -388,7 +405,8 @@ router.post("/seedpass/verify", async (req, res) => {
       // pruned users leaving a dangling index entry that would 404).
       if (prof.exists()) uid = idxUid;
     }
-    // 2) Fallback — sweep users for a stored code (also repairs the index).
+    // 2) Fallback — sweep users for a stored code (also repairs the index,
+    // carrying the owner's name+email so it stays self-describing).
     if (!uid) {
       const usersSnap = await rtdb().ref("users").get();
       const users = usersSnap.val() || {};
@@ -396,7 +414,12 @@ router.post("/seedpass/verify", async (req, res) => {
         if (String(p?.seedPassCode || "").trim().toUpperCase() === code) {
           uid = id;
           try {
-            await rtdb().ref(`seedPassIndex/${code}`).set({ uid: id });
+            await rtdb().ref(`seedPassIndex/${code}`).set({
+              uid: id,
+              fullName: String(p?.fullName || p?.name || ""),
+              email: String(p?.email || "").toLowerCase(),
+              updatedAt: new Date().toISOString(),
+            });
           } catch { /* index repair is best-effort */ }
           break;
         }

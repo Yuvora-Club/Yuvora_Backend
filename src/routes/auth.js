@@ -121,7 +121,7 @@ router.post("/register", async (req, res) => {
     try {
       let code = null;
       try {
-        code = await mintSeedPassCode(record.uid);
+        code = await mintSeedPassCode(record.uid, { fullName: clean.fullName, email: clean.email });
       } catch (e) {
         console.warn("[register] seed-pass mint skipped:", e?.message || e);
       }
@@ -167,7 +167,21 @@ function keyMissing(res) {
 // Mint the member's stable seed-pass code (YV-XXXX) + reverse index.
 // Deterministic from uid, so every new-account entrypoint (register, Google
 // sign-in) produces the same code shape. Returns the code or null.
-async function mintSeedPassCode(uid) {
+//
+// The code lives on the user record (`users/{uid}.seedPassCode`) AND the
+// reverse index carries the owner's name+email
+// (`seedPassIndex/{CODE} = { uid, fullName, email, updatedAt }`) so the
+// index is self-describing — no blind second lookup needed to know whose
+// code it is. Readers only ever match on `uid`, so extra fields are safe.
+async function mintSeedPassCode(uid, who = {}) {
+  const fullName = String(who.fullName || "").trim();
+  const email = String(who.email || "").trim().toLowerCase();
+  const stamp = () => ({
+    uid,
+    fullName,
+    email,
+    updatedAt: new Date().toISOString(),
+  });
   let h = 0x811c9dc5;
   const s = String(uid || "");
   for (let i = 0; i < s.length; i++) {
@@ -181,7 +195,7 @@ async function mintSeedPassCode(uid) {
     const val = idx.val();
     if (!val || val.uid === uid) {
       await rtdb().ref(`users/${uid}`).update({ seedPassCode: candidate });
-      await rtdb().ref(`seedPassIndex/${candidate}`).set({ uid });
+      await rtdb().ref(`seedPassIndex/${candidate}`).set(stamp());
       return candidate;
     }
     num = num >= 9999 ? 1000 : num + 1;
@@ -353,7 +367,7 @@ router.post("/google", async (req, res) => {
         // update() (not set()) so a re-run can never clobber an existing ref.
         await rtdb().ref(`users/${uid}`).update(profile);
         try {
-          const code = await mintSeedPassCode(uid);
+          const code = await mintSeedPassCode(uid, { fullName: profile.fullName, email: profile.email });
           if (code) profile.seedPassCode = code;
         } catch (e) {
           console.warn("[google] seed-pass mint skipped:", e?.message || e);

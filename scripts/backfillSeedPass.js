@@ -1,8 +1,10 @@
-// Backfill stable seed-pass codes for members who joined before the feature.
+// Backfill stable seed-pass codes for members who joined before the feature,
+// and enrich the reverse index so every entry carries its owner's name.
 // Run:  Set-Location Backend; node scripts/backfillSeedPass.js; Set-Location ..
 // Reads Firebase Admin credentials from Backend/.env. Idempotent — skips
-// users who already have a valid YV-XXXX code. Prints every code so you can
-// hand them out at the gate.
+// users who already have a valid YV-XXXX code (topping up the index entry
+// with name+email when missing). Prints every code so you can hand them
+// out at the gate.
 
 import "dotenv/config";
 import { initFirebase, rtdb } from "../src/firebase.js";
@@ -31,11 +33,26 @@ async function main() {
   let kept = 0;
   for (const uid of ids) {
     const p = users[uid] || {};
+    const who = {
+      uid,
+      fullName: String(p.fullName || p.name || ""),
+      email: String(p.email || "").toLowerCase(),
+      updatedAt: new Date().toISOString(),
+    };
     const existing = String(p.seedPassCode || "").trim().toUpperCase();
     if (/^YV-\d{4}$/.test(existing)) {
       try {
         const idx = await rtdb().ref(`seedPassIndex/${existing}`).get();
-        if (!idx.exists()) await rtdb().ref(`seedPassIndex/${existing}`).set({ uid });
+        const val = idx.val();
+        if (!val) await rtdb().ref(`seedPassIndex/${existing}`).set(who);
+        else if (val.uid === uid && (!val.fullName || !val.email)) {
+          await rtdb().ref(`seedPassIndex/${existing}`).update({
+            fullName: who.fullName,
+            email: who.email,
+            updatedAt: who.updatedAt,
+          });
+          console.log(`[seedpass] enrich ${who.fullName || who.email || uid} -> ${existing}`);
+        }
       } catch { /* best-effort */ }
       console.log(`[seedpass] keep  ${p.fullName || p.email || uid} -> ${existing}`);
       kept++;
@@ -58,7 +75,12 @@ async function main() {
       continue;
     }
     await rtdb().ref(`users/${uid}`).update({ seedPassCode: code });
-    await rtdb().ref(`seedPassIndex/${code}`).set({ uid });
+    await rtdb().ref(`seedPassIndex/${code}`).set({
+      uid,
+      fullName: String(p.fullName || p.name || ""),
+      email: String(p.email || "").toLowerCase(),
+      updatedAt: new Date().toISOString(),
+    });
     console.log(`[seedpass] mint  ${p.fullName || p.email || uid} -> ${code}`);
     minted++;
   }

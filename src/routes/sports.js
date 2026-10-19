@@ -770,6 +770,12 @@ router.get("/my-seedpass", requireAuth, async (req, res) => {
     const profile = snap.val();
     if (!profile) return res.status(404).json({ ok: false, error: "Profile not found." });
     let code = String(profile.seedPassCode || "").trim().toUpperCase();
+    const who = {
+      uid: req.member.uid,
+      fullName: String(profile.fullName || profile.name || ""),
+      email: String(profile.email || "").toLowerCase(),
+      updatedAt: new Date().toISOString(),
+    };
     if (!/^YV-\d{4}$/.test(code)) {
       // Mint: deterministic from uid, bump on collision.
       let h = 0x811c9dc5;
@@ -792,11 +798,19 @@ router.get("/my-seedpass", requireAuth, async (req, res) => {
       }
       if (!code) return res.status(500).json({ ok: false, error: "Could not mint a pass code." });
       await userRef.update({ seedPassCode: code });
-      await rtdb().ref(`seedPassIndex/${code}`).set({ uid: req.member.uid });
+      await rtdb().ref(`seedPassIndex/${code}`).set(who);
     } else {
       try {
         const idx = await rtdb().ref(`seedPassIndex/${code}`).get();
-        if (!idx.exists()) await rtdb().ref(`seedPassIndex/${code}`).set({ uid: req.member.uid });
+        const val = idx.val();
+        if (!val) await rtdb().ref(`seedPassIndex/${code}`).set(who);
+        else if (val.uid === req.member.uid && (!val.fullName || !val.email)) {
+          await rtdb().ref(`seedPassIndex/${code}`).update({
+            fullName: who.fullName,
+            email: who.email,
+            updatedAt: who.updatedAt,
+          });
+        }
       } catch { /* index repair is best-effort */ }
     }
     return res.json({ ok: true, code });
