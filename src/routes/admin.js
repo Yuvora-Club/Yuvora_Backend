@@ -1,9 +1,15 @@
 // Admin user management.
 // All routes below require an admin ID token (see middleware/requireAdmin.js).
+// Only assigned admins (users/{uid}.role === "admin" or an admin custom
+// claim) can reach ANY route in this file — members get 403.
 //   GET  /api/admin/me    -> the caller's own admin profile
 //   GET  /api/admin/users -> every profile in `users/` (admins first)
 //   POST /api/admin/users -> create a Firebase Auth user + `users/{uid}`
 //                            profile with role "admin" (dynamic add-user page).
+//   GET  /api/admin/plans       -> every club future-plan todo (admin-only)
+//   POST /api/admin/plans       -> create a future-plan todo
+//   PUT  /api/admin/plans/:id   -> update a future-plan todo
+//   DELETE /api/admin/plans/:id -> delete a future-plan todo
 
 import { Router } from "express";
 import { auth, rtdb, isFirebaseReady } from "../firebase.js";
@@ -44,11 +50,13 @@ function validateNewAdmin(body) {
   const phone = cleanPhone(body?.phone ?? "");
   const birthDate = String(body?.birthDate ?? "").trim();
   const password = String(body?.password ?? "");
+  const role = String(body?.role ?? "admin").trim().toLowerCase();
   if (fullName.length < 2) errors.fullName = "Please enter the admin's full name.";
   if (!EMAIL_RE.test(email)) errors.email = "Enter a valid email address.";
   if (school.length < 2) errors.school = "Please tell us their school.";
   else if (school.length > 120) errors.school = "School name is too long.";
   if (!phone) errors.phone = "Enter a 10-digit contact number.";
+  if (role !== "admin" && role !== "member") errors.role = "Role must be admin or member.";
   let age = null;
   if (birthDate) {
     age = ageFromBirthDate(birthDate);
@@ -61,7 +69,7 @@ function validateNewAdmin(body) {
     errors.birthDate = "Give a birth date (age is computed from it).";
   }
   if (!password || password.length < 8) errors.password = "Password needs at least 8 characters.";
-  return { errors, clean: { fullName, email, school, phone, birthDate: birthDate || null, age, password } };
+  return { errors, clean: { fullName, email, school, phone, birthDate: birthDate || null, age, password, role } };
 }
 
 // Seed passes — membership check for the Verify tab (gate / social entry).
@@ -241,7 +249,9 @@ router.get("/users", async (_req, res) => {
   }
 });
 
-// Dynamically add a user WITH admin powers (the sidebar "Add User" page).
+// Dynamically add a user WITH an assigned role (the sidebar "Add User" page).
+// Role is fixed AT CREATION: "admin" can open /admin, "member" cannot.
+// Only an existing assigned admin (requireAdmin above) can call this.
 router.post("/users", async (req, res) => {
   if (!isFirebaseReady()) {
     return res.status(503).json({ ok: false, error: "Firebase is not configured on the backend yet." });
@@ -266,7 +276,7 @@ router.post("/users", async (req, res) => {
       throw err;
     }
 
-    await auth().setCustomUserClaims(record.uid, { admin: true, role: "admin" });
+    await auth().setCustomUserClaims(record.uid, clean.role === "admin" ? { admin: true, role: "admin" } : {});
 
     const now = new Date().toISOString();
     const profile = {
@@ -277,7 +287,7 @@ router.post("/users", async (req, res) => {
       phone: clean.phone,
       birthDate: clean.birthDate,
       age: clean.age,
-      role: "admin",
+      role: clean.role,
       termsAcceptedAt: now,
       createdAt: now,
       createdBy: req.admin.uid,
@@ -287,7 +297,7 @@ router.post("/users", async (req, res) => {
     return res.status(201).json({ ok: true, user: publicProfile(record.uid, profile) });
   } catch (err) {
     console.error("POST /api/admin/users failed:", err?.code || err?.message || err);
-    return res.status(500).json({ ok: false, error: "Could not create the admin user." });
+    return res.status(500).json({ ok: false, error: "Could not create the user." });
   }
 });
 
@@ -454,6 +464,139 @@ router.post("/seedpass/verify", async (req, res) => {
       error: "Could not verify that code. Try again.",
       detail: err?.message || String(err),
     });
+  }
+});
+
+// ---- Club future plans (Future Plans tab in /admin, admin-only) ----
+// Private crew todos: what to build / host / buy next. Visible only to
+// assigned admins — the whole router already sits behind requireAdmin, so
+// members can never list, create, edit or delete these.
+//
+// Storage (Realtime Database):
+//   clubPlans/{planId} = { title, details, status, priority, dueDate,
+//                          createdAt, updatedAt, createdBy, createdByName }
+// Statuses: todo | in-progress | done. Priorities: low | medium | high.
+
+const PLAN_STATUSES = ["todo", "in-progress", "done"];
+const PLAN_PRIORITIES = ["low", "medium", "high"];
+
+function validatePlan(body) {
+  const errors = {};
+  const title = String(body?.title ?? "").trim();
+  const details = String(body?.details ?? "").trim();
+  const status = String(body?.status ?? "todo").trim();
+  const priority = String(body?.priority ?? "medium").trim();
+  const dueDate = String(body?.dueDate ?? "").trim();
+  if (title.length < 3) errors.title = "Give the plan a title (min 3 characters).";
+  else if (title.length > 120) errors.title = "Title is too long (max 120).";
+  if (details.length > 2000) errors.details = "Details are too long (max 2000).";
+  if (!PLAN_STATUSES.includes(status)) errors.status = "Status must be todo, in-progress or done.";
+  if (!PLAN_PRIORITIES.includes(priority)) errors.priority = "Priority must be low, medium or high.";
+  if (dueDate && !/^\d{4}-\d{2}-\d{2}$/.test(dueDate)) errors.dueDate = "Due date must be YYYY-MM-DD.";
+  return {
+    errors,
+    clean: {
+      title,
+      details,
+      status: PLAN_STATUSES.includes(status) ? status : "todo",
+      priority: PLAN_PRIORITIES.includes(priority) ? priority : "medium",
+      dueDate: dueDate || null,
+    },
+  };
+}
+
+function publicPlan(id, p) {
+  if (!p) return null;
+  return {
+    id,
+    title: p.title || "",
+    details: p.details || "",
+    status: PLAN_STATUSES.includes(p.status) ? p.status : "todo",
+    priority: PLAN_PRIORITIES.includes(p.priority) ? p.priority : "medium",
+    dueDate: p.dueDate || null,
+    createdAt: p.createdAt || null,
+    updatedAt: p.updatedAt || null,
+    createdBy: p.createdBy || null,
+    createdByName: p.createdByName || null,
+  };
+}
+
+// GET /api/admin/plans — every future plan, newest first.
+router.get("/plans", async (_req, res) => {
+  try {
+    const snap = await rtdb().ref("clubPlans").get();
+    const val = snap.val() || {};
+    const plans = Object.entries(val).map(([id, p]) => publicPlan(id, p || {}));
+    plans.sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")));
+    return res.json({ ok: true, plans });
+  } catch (err) {
+    console.error("GET /api/admin/plans failed:", err?.message || err);
+    return res.status(500).json({ ok: false, error: "Could not load future plans." });
+  }
+});
+
+// POST /api/admin/plans — create a future-plan todo.
+router.post("/plans", async (req, res) => {
+  const { errors, clean } = validatePlan(req.body);
+  if (Object.keys(errors).length > 0) return res.status(400).json({ ok: false, errors });
+  try {
+    let creatorName = null;
+    try {
+      const prof = (await rtdb().ref(`users/${req.admin.uid}`).get()).val() || null;
+      creatorName = prof?.fullName || prof?.name || null;
+    } catch {
+      creatorName = null;
+    }
+    const now = new Date().toISOString();
+    const doc = {
+      ...clean,
+      createdAt: now,
+      updatedAt: now,
+      createdBy: req.admin.uid,
+      createdByName: creatorName,
+    };
+    const ref = rtdb().ref("clubPlans").push();
+    await ref.set(doc);
+    return res.status(201).json({ ok: true, plan: publicPlan(ref.key, doc) });
+  } catch (err) {
+    console.error("POST /api/admin/plans failed:", err?.message || err);
+    return res.status(500).json({ ok: false, error: "Could not create the plan." });
+  }
+});
+
+// PUT /api/admin/plans/:id — update title / details / status / priority / dueDate.
+router.put("/plans/:id", async (req, res) => {
+  const id = String(req.params.id || "").trim();
+  if (!id) return res.status(400).json({ ok: false, error: "Missing plan id." });
+  const { errors, clean } = validatePlan(req.body);
+  if (Object.keys(errors).length > 0) return res.status(400).json({ ok: false, errors });
+  try {
+    const ref = rtdb().ref(`clubPlans/${id}`);
+    const snap = await ref.get();
+    if (!snap.exists()) return res.status(404).json({ ok: false, error: "That plan no longer exists." });
+    const patch = { ...clean, updatedAt: new Date().toISOString() };
+    await ref.update(patch);
+    const next = (await ref.get()).val() || {};
+    return res.json({ ok: true, plan: publicPlan(id, next) });
+  } catch (err) {
+    console.error("PUT /api/admin/plans/:id failed:", err?.message || err);
+    return res.status(500).json({ ok: false, error: "Could not update the plan." });
+  }
+});
+
+// DELETE /api/admin/plans/:id — remove a future-plan todo.
+router.delete("/plans/:id", async (req, res) => {
+  const id = String(req.params.id || "").trim();
+  if (!id) return res.status(400).json({ ok: false, error: "Missing plan id." });
+  try {
+    const ref = rtdb().ref(`clubPlans/${id}`);
+    const snap = await ref.get();
+    if (!snap.exists()) return res.status(404).json({ ok: false, error: "That plan no longer exists." });
+    await ref.remove();
+    return res.json({ ok: true, id });
+  } catch (err) {
+    console.error("DELETE /api/admin/plans/:id failed:", err?.message || err);
+    return res.status(500).json({ ok: false, error: "Could not delete the plan." });
   }
 });
 
